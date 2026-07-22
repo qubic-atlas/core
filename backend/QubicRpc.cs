@@ -189,8 +189,10 @@ public sealed class QubicRpc
             ComputorPublicKey = sourceId is null ? "" : IdentityToPubkeyHex(sourceId),
             MiningSeed = miningSeed,
             Nonce = nonce,
+            // timestamp sits on the OUTER wrapper for by-hash (/v2/transactions/{id}) but inline for
+            // flat firehose items — check both so the proof detail page gets a "when" too.
             TickNumber = ToLong(t["tickNumber"]),
-            Timestamp = TimestampNode(t["timestamp"]),
+            Timestamp = TimestampNode(tx["timestamp"] ?? t["timestamp"]),
         };
     }
 
@@ -262,7 +264,7 @@ public sealed class QubicRpc
     public async Task<Solution> GetSolution(string hash)
     {
         var d = await J($"{_rpc}/v2/transactions/{Uri.EscapeDataString(hash)}");
-        var s = ToSolution(d["transaction"] ?? d);
+        var s = ToSolution(d);   // pass the full wrapper so the outer `timestamp` is captured
         if (s is null) throw new Exception("not_a_solution_tx");
         return s;
     }

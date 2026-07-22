@@ -27,19 +27,10 @@ static void hx(const char* hex, unsigned char* out, int n){ for(int i=0;i<n;i++)
 
 static const int MAX_LINKS = 4000; // render cap; totals still reported
 
-int main(int argc, char** argv) {
-    if (argc < 5) { fprintf(stderr, "usage: verifier <miningSeedHex> <pubKeyHex> <nonceHex> <expectedScore|-1> [threshold]\n"); return 2; }
-    unsigned char miningSeed[32], publicKey[32], nonce[32];
-    hx(argv[1], miningSeed, 32); hx(argv[2], publicKey, 32); hx(argv[3], nonce, 32);
-    long expected = atol(argv[4]);
+// Emit the full reconstruction JSON for ONE proof, scoring against an already-built seed pool.
+static void runOne(const unsigned char* publicKey, const unsigned char* nonce, long expected, const unsigned char* pool) {
     int isHI = (nonce[0] & 1) == 0;
     const char* algo = isHI ? "HyperIdentity" : "Addition";
-
-    // Public, deterministic ~512MB random pool from the mining seed.
-    unsigned char* pool = (unsigned char*)malloc(POOL_VEC_PADDING_SIZE);
-    if (!pool) { fprintf(stderr, "pool alloc failed\n"); return 2; }
-    unsigned char state[STATE_SIZE];
-    generateRandom2Pool(miningSeed, state, pool);
 
     printf("{\n");
     printf("  \"reconstructorVersion\": \"qubic-atlas-verify-1\",\n");
@@ -195,6 +186,56 @@ int main(int argc, char** argv) {
         printf("]\n  }\n");
     }
     printf("}\n");
-    free(pool);
+}
+
+// ~512MB seed pool, cached across calls: regenerated ONLY when the miningSeed changes. This is the
+// whole point of --serve mode — the ~610ms pool-gen is amortized over every proof sharing a seed.
+static unsigned char* g_pool = nullptr;
+static unsigned char g_lastSeed[32];
+static bool g_haveSeed = false;
+static bool ensurePool(const unsigned char* miningSeed) {
+    if (!g_pool) {
+        g_pool = (unsigned char*)malloc(POOL_VEC_PADDING_SIZE);
+        if (!g_pool) { fprintf(stderr, "pool alloc failed\n"); return false; }
+    }
+    if (!g_haveSeed || memcmp(miningSeed, g_lastSeed, 32) != 0) {
+        unsigned char state[STATE_SIZE];
+        generateRandom2Pool(miningSeed, state, g_pool);
+        memcpy(g_lastSeed, miningSeed, 32);
+        g_haveSeed = true;
+    }
+    return true;
+}
+
+int main(int argc, char** argv) {
+    // ---- daemon mode: keep the process (and its seed pool) warm; one proof per stdin line ----
+    // Request : "<seedHex> <pkHex> <nonceHex> <expected|-1>\n"
+    // Response: the reconstruction JSON, then a lone "__ATLAS_EOF__" line as delimiter.
+    // Exits on stdin EOF. The pool rebuilds only when the seed differs from the previous request.
+    if (argc >= 2 && strcmp(argv[1], "--serve") == 0) {
+        fprintf(stderr, "[verifier] serve mode ready (pool cached per miningSeed)\n");
+        char seedHex[80], pkHex[80], nonceHex[80], line[512]; long expected;
+        while (fgets(line, sizeof(line), stdin)) {
+            int n = sscanf(line, "%79s %79s %79s %ld", seedHex, pkHex, nonceHex, &expected);
+            if (n < 3 || strlen(seedHex) < 64 || strlen(pkHex) < 64 || strlen(nonceHex) < 64) {
+                printf("{\"error\":\"bad_request\"}\n__ATLAS_EOF__\n"); fflush(stdout); continue;
+            }
+            if (n < 4) expected = -1;
+            unsigned char miningSeed[32], publicKey[32], nonce[32];
+            hx(seedHex, miningSeed, 32); hx(pkHex, publicKey, 32); hx(nonceHex, nonce, 32);
+            if (!ensurePool(miningSeed)) { printf("{\"error\":\"pool_alloc\"}\n__ATLAS_EOF__\n"); fflush(stdout); continue; }
+            runOne(publicKey, nonce, expected, g_pool);
+            printf("__ATLAS_EOF__\n"); fflush(stdout);
+        }
+        return 0;
+    }
+
+    // ---- one-shot mode (unchanged output): single proof from argv; used by the API referee ----
+    if (argc < 5) { fprintf(stderr, "usage: verifier <miningSeedHex> <pubKeyHex> <nonceHex> <expectedScore|-1> [threshold]\n"); return 2; }
+    unsigned char miningSeed[32], publicKey[32], nonce[32];
+    hx(argv[1], miningSeed, 32); hx(argv[2], publicKey, 32); hx(argv[3], nonce, 32);
+    long expected = atol(argv[4]);
+    if (!ensurePool(miningSeed)) return 2;
+    runOne(publicKey, nonce, expected, g_pool);
     return 0;
 }

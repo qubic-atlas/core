@@ -24,6 +24,9 @@ import { t } from "../i18n.js";
     </div>
     <div class="wrap site-footer__foot">
       <span class="site-footer__disclaimer">{{ t("footer.disclaimer") }}</span>
+      <span class="site-footer__meta">
+        · <a href="https://github.com/qubic-atlas/core" target="_blank" rel="noopener">Qubic Atlas v0.1 Beta</a> · <a href="https://github.com/qubic-atlas/core" target="_blank" rel="noopener">GitHub ↗</a>
+      </span>
     </div>
   </footer>
 </template>

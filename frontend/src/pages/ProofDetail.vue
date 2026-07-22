@@ -1,7 +1,8 @@
 <script setup>
 import { ref, watch } from "vue";
 import { useRoute } from "vue-router";
-import { api, short, fmt } from "../api.js";
+import { api, short, fmt, fmtTime, timeAgo, explorerTick, explorerTx } from "../api.js";
+import { t } from "../i18n.js";
 import AnnViews from "../components/AnnViews.vue";
 import MutationReplay from "../components/MutationReplay.vue";
 import Explainer from "../components/Explainer.vue";
@@ -39,85 +40,79 @@ watch(() => route.params.hash, loadHash, { immediate: true });
 </script>
 
 <template>
-  <div v-if="err && !sol" class="banner no">Could not load proof: {{ err }}</div>
-  <div v-else-if="!sol" class="center muted pad"><span class="spin" /> loading proof…</div>
+  <div v-if="err && !sol" class="banner no">{{ t("pages.proofDetail.couldNotLoad") }}: {{ err }}</div>
+  <div v-else-if="!sol" class="center muted pad"><span class="spin" /> {{ t("pages.proofDetail.loadingProof") }}</div>
   <template v-else>
-    <p class="sub"><router-link to="/proofs">← Proofs</router-link></p>
+    <p class="sub"><router-link to="/proofs">← {{ t("nav.proofs") }}</router-link></p>
     <h1 class="detail-title">
       <span class="chip" :class="sol.algorithm === 'HyperIdentity' ? 'hi' : 'add'">{{ sol.algorithm }}</span>
       <span class="mono detail-title__hash">{{ short(route.params.hash, 10) }}</span>
+      <a :href="explorerTx(route.params.hash)" target="_blank" rel="noopener" class="ext" title="View transaction on the Qubic explorer">↗</a>
     </h1>
 
     <!-- verification banner -->
     <div v-if="recon" class="banner" :class="recon.passesThreshold ? 'ok' : 'no'">
-      <b class="banner__lead">{{ recon.passesThreshold ? "✓ Verified locally" : "✗ Does not pass threshold" }}</b>
-      {{ " — " }}re-scored in your verifier from public inputs:&nbsp;
-      <b>score {{ recon.score }}</b> vs threshold {{ recon.threshold }}.
+      <b class="banner__lead">{{ recon.passesThreshold ? t("pages.proofDetail.verifiedLocally") : t("pages.proofDetail.notPass") }}</b>
+      {{ " — " }}{{ t("pages.proofDetail.rescored") }}&nbsp;
+      <b>{{ t("pages.proofDetail.scoreWord") }} {{ recon.score }}</b> {{ t("pages.proofDetail.vsThreshold") }} {{ recon.threshold }}.
       <template v-if="recon.relayClaimedScore >= 0">
-        Relay claimed {{ recon.relayClaimedScore }} → <b :class="recon.scoreMatches ? 'txt-good' : 'txt-bad'">{{ recon.scoreMatches ? "matches" : "MISMATCH" }}</b>.
+        {{ t("pages.proofDetail.relayClaimed") }} {{ recon.relayClaimedScore }} → <b :class="recon.scoreMatches ? 'txt-good' : 'txt-bad'">{{ recon.scoreMatches ? t("pages.proofDetail.matches") : t("pages.proofDetail.mismatch") }}</b>.
       </template>
-      <span class="muted"> ({{ recon.elapsedMs ? recon.elapsedMs + " ms" : "cached" }}, {{ recon.reconstructorVersion }})</span>
+      <span class="muted"> ({{ recon.elapsedMs ? recon.elapsedMs + " ms" : t("pages.proofDetail.cached") }}, {{ recon.reconstructorVersion }})</span>
     </div>
     <div v-else class="banner ok banner--info">
-      This page trusts <b>nothing</b>. Click <b>Verify locally</b> to re-run the canonical Core scorer on the public
-      inputs and reconstruct the neural genome independently.
+      <span v-html="t('pages.proofDetail.trustNothing')"></span>
       <button class="primary banner__btn" @click="verify" :disabled="verifying">
-        <template v-if="verifying"><span class="spin" /> reconstructing…</template>
-        <template v-else>⛬ Verify locally</template>
+        <template v-if="verifying"><span class="spin" /> {{ t("pages.proofDetail.reconstructing") }}</template>
+        <template v-else>{{ t("pages.proofDetail.verifyLocally") }}</template>
       </button>
-      <span v-if="verifying && sol.algorithm === 'HyperIdentity'" class="muted"> HyperIdentity replays 1000 ticks × 150 mutations — a few seconds.</span>
+      <span v-if="verifying && sol.algorithm === 'HyperIdentity'" class="muted"> {{ t("pages.proofDetail.hiHint") }}</span>
     </div>
-    <div v-if="err" class="banner no">Verify failed: {{ err }}</div>
+    <div v-if="err" class="banner no">{{ t("pages.proofDetail.verifyFailed") }}: {{ err }}</div>
 
     <Explainer :algorithm="sol.algorithm" />
 
     <div class="grid2">
       <div class="panel pad">
-        <h3>Proof</h3>
+        <h3>{{ t("pages.proofDetail.proof") }}</h3>
         <div class="kv mono">
-          <div class="k">Epoch</div><div class="v">{{ sol.epoch }} · {{ sol.coreVersion }}</div>
-          <div class="k">Computor</div><div class="v"><router-link :to="`/computors/${sol.computorId}`">{{ sol.computorId }}</router-link></div>
-          <div class="k">Tick</div><div class="v">{{ fmt(sol.tickNumber) }}</div>
-          <div class="k">Score rule</div><div class="v">{{ sol.scoreRule }} (threshold {{ fmt(sol.threshold) }})</div>
-          <div class="k">Mining seed</div><div class="v">{{ sol.miningSeed }}</div>
-          <div class="k">Nonce</div><div class="v">{{ sol.nonce }}</div>
-          <div class="k">Genome id</div><div class="v">{{ sol.annGenomeId }}</div>
+          <div class="k">{{ t("table.epoch") }}</div><div class="v">{{ sol.epoch }} · {{ sol.coreVersion }}</div>
+          <div class="k">{{ t("table.computor") }}</div><div class="v"><router-link :to="`/computors/${sol.computorId}`">{{ sol.computorId }}</router-link></div>
+          <div class="k">{{ t("table.tick") }}</div><div class="v"><a :href="explorerTick(sol.tickNumber)" target="_blank" rel="noopener" class="ext-plain">{{ fmt(sol.tickNumber) }} ↗</a></div>
+          <div class="k">{{ t("table.when") }}</div><div class="v">{{ sol.timestamp ? `${fmtTime(sol.timestamp)} (${timeAgo(sol.timestamp)})` : "—" }}</div>
+          <div class="k">{{ t("pages.proofDetail.scoreRule") }}</div><div class="v">{{ sol.scoreRule }} ({{ t("pages.proofDetail.thresholdWord") }} {{ fmt(sol.threshold) }})</div>
+          <div class="k">{{ t("pages.proofDetail.miningSeed") }}</div><div class="v">{{ sol.miningSeed }}</div>
+          <div class="k">{{ t("pages.proofDetail.nonce") }}</div><div class="v">{{ sol.nonce }}</div>
+          <div class="k">{{ t("pages.proofDetail.genomeId") }}</div><div class="v">{{ sol.annGenomeId }}</div>
         </div>
       </div>
       <div class="panel pad">
-        <h3>Reconstructed metrics</h3>
-        <div v-if="!recon?.metrics" class="muted">Verify to reconstruct structural metrics.</div>
+        <h3>{{ t("pages.proofDetail.reconstructedMetrics") }}</h3>
+        <div v-if="!recon?.metrics" class="muted">{{ t("pages.proofDetail.verifyToReconstruct") }}</div>
         <div v-else class="stats">
-          <div class="stat"><div class="k">Population</div><div class="v">{{ fmt(recon.metrics.population) }}</div></div>
-          <div class="stat"><div class="k">Input neurons</div><div class="v">{{ fmt(recon.metrics.inputNeurons) }}</div></div>
-          <div class="stat"><div class="k">Output neurons</div><div class="v">{{ fmt(recon.metrics.outputNeurons) }}</div></div>
-          <div class="stat"><div class="k">Evolution neurons</div><div class="v">{{ fmt(recon.metrics.evolutionNeurons) }}</div></div>
-          <div class="stat"><div class="k">Non-zero synapses</div><div class="v">{{ fmt(recon.metrics.nonzeroSynapses) }}</div></div>
-          <div class="stat"><div class="k">Synapse density</div><div class="v">{{ recon.metrics.synapseDensity != null ? (recon.metrics.synapseDensity * 100).toFixed(2) + "%" : "—" }}</div></div>
-          <div class="stat"><div class="k">Accepted mutations</div><div class="v">{{ fmt(recon.metrics.acceptedMutations) }} / {{ fmt(recon.metrics.executedMutations) }}</div></div>
-          <div class="stat"><div class="k">Ticks</div><div class="v">{{ fmt(recon.metrics.ticks) }}</div></div>
+          <div class="stat"><div class="k">{{ t("pages.proofDetail.population") }}</div><div class="v">{{ fmt(recon.metrics.population) }}</div></div>
+          <div class="stat"><div class="k">{{ t("pages.proofDetail.inputNeurons") }}</div><div class="v">{{ fmt(recon.metrics.inputNeurons) }}</div></div>
+          <div class="stat"><div class="k">{{ t("pages.proofDetail.outputNeurons") }}</div><div class="v">{{ fmt(recon.metrics.outputNeurons) }}</div></div>
+          <div class="stat"><div class="k">{{ t("pages.proofDetail.evolutionNeurons") }}</div><div class="v">{{ fmt(recon.metrics.evolutionNeurons) }}</div></div>
+          <div class="stat"><div class="k">{{ t("pages.proofDetail.nonzeroSynapses") }}</div><div class="v">{{ fmt(recon.metrics.nonzeroSynapses) }}</div></div>
+          <div class="stat"><div class="k">{{ t("pages.proofDetail.synapseDensity") }}</div><div class="v">{{ recon.metrics.synapseDensity != null ? (recon.metrics.synapseDensity * 100).toFixed(2) + "%" : "—" }}</div></div>
+          <div class="stat"><div class="k">{{ t("pages.proofDetail.acceptedMutations") }}</div><div class="v">{{ fmt(recon.metrics.acceptedMutations) }} / {{ fmt(recon.metrics.executedMutations) }}</div></div>
+          <div class="stat"><div class="k">{{ t("pages.proofDetail.ticksLabel") }}</div><div class="v">{{ fmt(recon.metrics.ticks) }}</div></div>
         </div>
       </div>
     </div>
 
     <div v-if="recon && recon.graph" class="panel pad mt-16">
-      <h3 class="flush">The network this miner trained
-        <span class="h3-note"> · {{ fmt(recon.graph.nodes.length) }} neurons · {{ fmt(recon.graph.totalLinks) }} synapses{{ recon.graph.truncatedLinks ? ` (showing ${fmt(recon.graph.renderedLinks)})` : "" }}</span>
+      <h3 class="flush">{{ t("pages.proofDetail.networkTitle") }}
+        <span class="h3-note"> · {{ fmt(recon.graph.nodes.length) }} {{ t("pages.proofDetail.neurons") }} · {{ fmt(recon.graph.totalLinks) }} {{ t("pages.proofDetail.synapses") }}{{ recon.graph.truncatedLinks ? ` (${t("pages.proofDetail.showingWord")} ${fmt(recon.graph.renderedLinks)})` : "" }}</span>
       </h3>
-      <p class="note">
-        Signals flow left→right, from inputs through the neurons the miner grew, to the outputs that produce the answer.
-        Teal connections strengthen a signal, red ones inhibit it. This is the actual reconstructed network — every
-        weight recomputed from public data.
-      </p>
+      <p class="note">{{ t("pages.proofDetail.networkNote") }}</p>
       <AnnViews :graph="recon.graph" />
     </div>
 
     <div v-if="recon && recon.mutationTrace" class="panel pad mt-16">
-      <h3 class="flush">How the miner found it <span class="h3-note"> · every mutation, replayed</span></h3>
-      <p class="note">
-        Each dot is one attempted mutation. The teal line is the best score so far — it only ratchets upward as the
-        miner keeps improvements and discards the rest, until it crosses the dashed threshold.
-      </p>
+      <h3 class="flush">{{ t("pages.proofDetail.howFound") }} <span class="h3-note"> · {{ t("pages.proofDetail.everyMutation") }}</span></h3>
+      <p class="note">{{ t("pages.proofDetail.howFoundNote") }}</p>
       <MutationReplay :trace="recon.mutationTrace" :threshold="recon.threshold" />
     </div>
   </template>

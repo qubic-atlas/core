@@ -36,7 +36,7 @@ public static class Registry
 
     // Epochs the currently-built verifier binary reproduces exactly (same param set as HEAD).
     // v1.297-v1.299 share the epoch-222 parameter set on this family.
-    public static readonly int[] SupportedEpochs = { 219, 220, 221, 222 };
+    public static readonly int[] SupportedEpochs = { 220, 221, 222, 223 };
 
     public static (bool Supported, string ParamSetId) ParamSetForEpoch(int? epoch)
     {
@@ -46,7 +46,7 @@ public static class Registry
 
     // ======================= Multi-epoch (backward-compatible) verification =======================
     // The verifier image ships FOUR era-specific binaries, each reproducing its epochs byte-exact:
-    //   build3 (current, /usr/local/bin/verifier)  -> epochs 215–222
+    //   build3 (current, /usr/local/bin/verifier)  -> epochs 215–223
     //   build0 (verifier-build0)                    -> epochs 197–203
     //   build1 (verifier-build1)                    -> epochs 204–206
     //   build2 (verifier-build2)                    -> epochs 207–214
@@ -79,6 +79,7 @@ public static class Registry
             [217] = new("build3", 316, 74300), [218] = new("build3", 316, 74100),
             [219] = new("build3", 316, 74100), [220] = new("build3", 316, 74100),
             [221] = new("build3", 316, 74100), [222] = new("build3", 316, 74100),
+            [223] = new("build3", 316, 74100),
         };
 
     // Core release span each build was compiled from (dual_hyperidentity_addition family).
@@ -95,6 +96,9 @@ public static class Registry
     // The Core version (range) for an epoch, via its build. "—" if unsupported.
     public static string CoreVersionForEpoch(int epoch)
         => EpochBuilds.TryGetValue(epoch, out var e) && BuildCoreVersion.TryGetValue(e.Build, out var v) ? v : "—";
+
+    // Highest epoch a bundled binary reproduces (grows as new epochs are added above).
+    public static readonly int MaxSupportedEpoch = EpochBuilds.Keys.Max();
 
     // Is this epoch reproducible by one of the bundled binaries? (false for <=196 and anything unlisted)
     public static bool IsSupported(int epoch) => EpochBuilds.ContainsKey(epoch);

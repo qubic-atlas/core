@@ -25,6 +25,8 @@ A documented, **free, public REST API** so anyone can consume Atlas's verified r
 
 - **Full historical coverage** — extend verification below epoch 197 (the earlier mining algorithm) if there's community demand.
 - **In-browser verification (WebAssembly)** — the scorer is AVX2 (not AVX-512), so a portable build can run *in the browser tab*, making the page itself a trustless verifier with no install.
+- **On-demand full reconstruction** — to keep server storage and payloads small, the verifier ships a *capped sample* of synapses per proof by default (the full network is always recomputed, only a subset is emitted). Let a user load the **complete** network when they compute it themselves — either in-browser via the WebAssembly verifier, or through a connected specialized worker/client that streams the full genome back. Unlocks full-detail visualization and analysis with zero extra storage cost to the service.
+- **Full 3D algorithm replay** — replay the *entire* reconstruction in 3D: watch the mutation search grow the network synapse by synapse, ratcheting toward the threshold, not just the finished graph. Builds directly on the full-data load above (needs the complete synapse set, so it pairs with the on-demand reconstruction).
 - **Multi-arch images** — publish `linux/arm64` alongside `amd64` so workers run on Raspberry Pi / ARM servers / Apple Silicon.
 - **Versioned image tags + signed releases** — semver tags beside `:latest`, image signing, and a public changelog.
 - **Contributor rewards** — each worker is a payable Qubic identity; enable community tipping/donations for high-contribution verifiers, surfaced on the leaderboard.

@@ -51,6 +51,12 @@ var trustedVersions = string.IsNullOrEmpty(verifierVersion)
 var queue = new JobQueue(requiredConfirmations, leaseMs: 180000,
     expectedVersion: trustedVersions, minReputation: minReputation);
 var store = new ClickHouseStore(clickhouseUrl, clickhouseDb, clickhouseUser, clickhousePassword);
+// Per-epoch estimated total on-chain solutions (density-sampled, background-refreshed). Used to
+// gauge how complete our verification coverage is for an epoch. Absent = not yet estimated.
+var epochEstimates = new System.Collections.Concurrent.ConcurrentDictionary<int, long>();
+// Feed observability (surfaced at /api/health) so "why aren't workers busy?" is answerable:
+// LOOP A (newest-fill) target/added and LOOP B (backfill) cursor/added.
+var feedState = new System.Collections.Concurrent.ConcurrentDictionary<string, object?>();
 
 Directory.CreateDirectory(cacheDir);
 // Start the HTTP server as fast as possible. Neither the firehose index nor ClickHouse is needed
@@ -119,8 +125,30 @@ string SparkOf(JsonNode recon)
     return string.Join(",", outp);
 }
 
+// Best-effort convert a proof's on-chain timestamp (ms/sec, string or number) to UTC; falls back
+// to now when unknown, so the `ts` column always holds the proof's time (verified_at holds ours).
+static DateTime TxTimeOrNow(object? ts)
+{
+    long ms = ts switch
+    {
+        long l => l,
+        int i => i,
+        string s when long.TryParse(s, out var v) => v,
+        JsonNode jn => jn.GetValueKind() switch
+        {
+            JsonValueKind.Number => jn.GetValue<long>(),
+            JsonValueKind.String => long.TryParse(jn.GetValue<string>(), out var v) ? v : 0,
+            _ => 0,
+        },
+        _ => 0,
+    };
+    if (ms > 1_000_000_000_000L) return DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
+    if (ms > 1_000_000_000L) return DateTimeOffset.FromUnixTimeSeconds(ms).UtcDateTime;
+    return DateTime.UtcNow;
+}
+
 async Task<string> PersistVerification(JsonNode recon, string hash, string? computorId, long tick,
-    int? epoch, string status, int confirmations, string? verifierVersion)
+    int? epoch, string status, int confirmations, string? verifierVersion, object? txTimestamp = null)
 {
     var genomeId = GenomeId.Compute(recon);
     if (!store.Enabled) return genomeId;
@@ -138,9 +166,10 @@ async Task<string> PersistVerification(JsonNode recon, string hash, string? comp
             : (NodeLong(o["threshold"]) ?? Registry.Threshold.GetValueOrDefault(algorithm));
         bool passes = score >= threshold;
         var now = DateTime.UtcNow;
+        var txTs = TxTimeOrNow(txTimestamp ?? o["timestamp"]);   // proof time (falls back to now)
 
         await store.UpsertVerificationAsync(new ClickHouseStore.VerificationRow(
-            Hash: hash, Epoch: ep, Tick: tick, Ts: now, Algorithm: algorithm,
+            Hash: hash, Epoch: ep, Tick: tick, Ts: txTs, Algorithm: algorithm,
             ComputorId: computorId ?? "", Score: score, Passes: passes, Threshold: threshold,
             GenomeId: genomeId, VerifierVersion: ver, Status: status,
             Confirmations: confirmations, Spark: SparkOf(recon), VerifiedAt: now));
@@ -208,6 +237,24 @@ async Task<JsonObject> VerifyForEpoch(int epoch, string miningSeed, string pubKe
     obj["threshold"] = threshold;
     obj["passesThreshold"] = score >= threshold;   // pass rule is score >= threshold for both algos
     return obj;
+}
+
+// Estimate an epoch's TOTAL on-chain solutions by sampling tick density: probe a uniform spread of
+// ticks, average solutions/tick, multiply by the epoch's tick span. Rough (mining is bursty) but
+// enough to gauge coverage = verified / estimated. Sampled ticks are RPC-cached.
+async Task<long> EstimateEpochSolutionsAsync(long first, long last, int samples = 24)
+{
+    long span = last - first + 1;
+    if (span <= 0) return 0;
+    var probes = await Task.WhenAll(Enumerable.Range(0, samples).Select(async i =>
+    {
+        long t = first + span * i / samples;
+        try { return ((await rpc.SolutionsInTick(t)).Count, true); }
+        catch { return (0, false); }
+    }));
+    int ok = probes.Count(p => p.Item2);
+    long found = probes.Sum(p => (long)p.Item1);
+    return ok == 0 ? 0 : (long)Math.Round((double)found / ok * span);
 }
 
 // Resolve a proof's epoch->build (null epoch or unsupported => build null; those are never leased
@@ -335,6 +382,7 @@ app.MapGet("/api/solutions", async (HttpRequest req) =>
             {
                 ["hash"] = r.Hash, ["algorithm"] = r.Algorithm, ["epoch"] = r.Epoch,
                 ["computorId"] = r.ComputorId, ["tickNumber"] = r.Tick,
+                ["timestamp"] = r.TsMs > 0 ? r.TsMs : null,
                 ["threshold"] = ThresholdFor(r.Epoch, r.Algorithm),
                 ["coreVersion"] = Registry.P.CoreVersion,
                 ["verification"] = new JsonObject
@@ -491,6 +539,11 @@ app.MapGet("/api/epochs", async () =>
             {
                 (long Verified, long Confirmed, long Conflicted) c = default;
                 bool has = counts is not null && counts.TryGetValue(e.Epoch, out c);
+                var (hiThr, addThr) = Registry.ThresholdsForEpoch(e.Epoch);   // exact per-epoch thresholds
+                long verified = has ? c.Verified : 0;
+                // Density-sampled estimate of total on-chain solutions (null until first computed).
+                long? est = epochEstimates.TryGetValue(e.Epoch, out var ev) ? ev : null;
+                double? coverage = est is > 0 ? Math.Min(1.0, (double)verified / est.Value) : null;
                 return new
                 {
                     epoch = e.Epoch,
@@ -498,11 +551,15 @@ app.MapGet("/api/epochs", async () =>
                     algoFamily = Registry.P.AlgoFamily,
                     firstTick = e.First,
                     lastTick = e.Last,
+                    hiThreshold = hiThr,      // HyperIdentity pass threshold for this epoch
+                    addThreshold = addThr,    // Addition pass threshold for this epoch
                     // proofs WE have verified in this epoch (we don't index every on-chain proof) —
                     // and how many reached network consensus.
-                    verified = has ? (object)c.Verified : 0,
+                    verified = (object)verified,
                     confirmed = has ? (object)c.Confirmed : 0,
                     conflicted = has ? (object)c.Conflicted : 0,
+                    estimatedProofs = est,          // ~ total on-chain solutions (density-sampled)
+                    coverage,                        // verified / estimated, 0..1 (null until estimated)
                 };
             }).ToList();
         return J(new { items, minSupportedEpoch = Registry.MinSupportedEpoch });
@@ -523,6 +580,7 @@ app.MapGet("/api/verifiers/leaderboard", async (int? limit) =>
             id = r.Id,
             verifications = r.Verifications,
             correct = r.Correct,
+            decided = r.Decided,   // proofs that reached consensus — accuracy = correct/decided
             firstSeen = r.FirstSeen.ToString("o"),
             lastSeen = r.LastSeen.ToString("o"),
         }).ToList();
@@ -544,7 +602,8 @@ app.MapGet("/api/computors/{id}", async (string id) =>
             var recent = rows.Select(r => (object)new JsonObject
             {
                 ["hash"] = r.Hash, ["algorithm"] = r.Algorithm, ["epoch"] = r.Epoch,
-                ["computorId"] = id, ["tickNumber"] = r.Tick, ["threshold"] = ThresholdFor(r.Epoch, r.Algorithm),
+                ["computorId"] = id, ["tickNumber"] = r.Tick, ["timestamp"] = r.TsMs > 0 ? r.TsMs : null,
+                ["threshold"] = ThresholdFor(r.Epoch, r.Algorithm),
                 ["coreVersion"] = Registry.P.CoreVersion,
                 ["verification"] = new JsonObject { ["status"] = r.Status, ["score"] = r.Score, ["spark"] = SparkArray(r.Spark) },
             }).ToList();
@@ -669,9 +728,9 @@ app.MapGet("/api/verifications/stats", async () =>
 {
     var s = await store.VerificationStatsAsync();
     if (s is null)
-        return J(new { source = store.Enabled ? "clickhouse" : "disabled", verified = 0, confirmed = 0, conflicted = 0, computors = 0 });
+        return J(new { source = store.Enabled ? "clickhouse" : "disabled", verified = 0, confirmed = 0, conflicted = 0, computors = 0, ratePerMin = 0 });
     var v = s.Value;
-    return J(new { source = "clickhouse", verified = v.Verified, confirmed = v.Confirmed, conflicted = v.Conflicted, computors = v.Computors });
+    return J(new { source = "clickhouse", verified = v.Verified, confirmed = v.Confirmed, conflicted = v.Conflicted, computors = v.Computors, ratePerMin = v.RecentPerMin });
 });
 
 // ---- THE decentralized bit: reconstruct + verify locally from public inputs ----
@@ -720,7 +779,7 @@ app.MapGet("/api/verify/{hash}", async (string hash, HttpRequest req) =>
                 minSupportedEpoch = Registry.MinSupportedEpoch,
                 detail = epoch is null
                     ? "could not resolve epoch for tick"
-                    : $"epoch {epoch} is not reproducible by any bundled verifier (supported: {Registry.MinSupportedEpoch}–222)",
+                    : $"epoch {epoch} is not reproducible by any bundled verifier (supported: {Registry.MinSupportedEpoch}–{Registry.MaxSupportedEpoch})",
             });
         var t0 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         // Dispatch to the era-correct binary and apply the exact per-epoch threshold.
@@ -733,6 +792,7 @@ app.MapGet("/api/verify/{hash}", async (string hash, HttpRequest req) =>
         obj["paramSetSupported"] = supported;
         obj["computorId"] = sol.ComputorId;
         obj["tickNumber"] = sol.TickNumber;
+        if (sol.Timestamp is not null) obj["timestamp"] = TsNode(sol.Timestamp);
         obj["inputs"] = new JsonObject
         {
             ["miningSeed"] = sol.MiningSeed,
@@ -747,7 +807,7 @@ app.MapGet("/api/verify/{hash}", async (string hash, HttpRequest req) =>
         req.HttpContext.Response.Headers["x-annx-cache"] = "miss";
         // Our own run is the referee: upsert a confirmed verdict (confirmations = 1).
         await PersistVerification(obj, clean, sol.ComputorId, sol.TickNumber, epoch,
-            "confirmed", 1, obj["reconstructorVersion"]?.GetValue<string>());
+            "confirmed", 1, obj["reconstructorVersion"]?.GetValue<string>(), sol.Timestamp);
         return Results.Content(outStr, "application/json");
     }
     catch (Exception e) { return Err(500, new { error = "verify_failed", detail = e.Message }); }
@@ -777,6 +837,7 @@ app.MapGet("/api/health", async () =>
         relay = "none (public archive only)",
         rpcCache = rpc.CacheStats(),
         clickhouse = ch,
+        feed = feedState,
     });
 });
 
@@ -944,19 +1005,33 @@ app.MapPost("/api/jobs/{id}/result", async (string id, HttpRequest req) =>
     if (outcome.State == JobQueue.ConsensusState.Pending)
         return J(new { done = false, status = "pending", confirmations = job.Confirmations });
 
-    // Non-pending: we need the proof metadata (computor/tick/epoch) to persist our verdict.
-    Solution sol;
-    try { sol = await rpc.GetSolution(job.Hash); }
-    catch (Exception e) { return Err(502, new { error = "rpc_failed", detail = e.Message }); }
-    var epoch = await epochMap.EpochForTickAsync(sol.TickNumber);
+    // Non-pending: we need the proof metadata (computor/tick/epoch). PREFER the job's captured
+    // inputs so a flaky archive can NEVER orphan a resolving job (that was starving the fleet);
+    // only fetch as a fallback for hash-only jobs, and even then never bail before finalizing.
+    string? computorId = job.ComputorId;
+    long tick = job.TickNumber ?? 0;
+    object? txTs = job.Timestamp;
+    string? miningSeed = job.MiningSeed, computorPubKey = job.ComputorPublicKey, nonce = job.Nonce;
+    if (computorId is null || tick == 0 || miningSeed is null)
+    {
+        try
+        {
+            var s = await rpc.GetSolution(job.Hash);
+            computorId ??= s.ComputorId; if (tick == 0) tick = s.TickNumber; txTs ??= s.Timestamp;
+            miningSeed ??= s.MiningSeed; computorPubKey ??= s.ComputorPublicKey; nonce ??= s.Nonce;
+        }
+        catch (Exception e) { Console.WriteLine($"[result] metadata fetch failed for {job.Hash}: {e.Message}"); }
+    }
+    var epoch = tick > 0 ? await epochMap.EpochForTickAsync(tick) : (int?)null;
 
     if (outcome.State == JobQueue.ConsensusState.Confirmed)
     {
+        // Finalize FIRST — the job must leave "resolving" no matter what persistence does.
         var fin = queue.Finalize(id, outcome.WinningGenomeId!, outcome.WinningScore, passes,
             threshold, algorithm, resolvedByReferee: false);
-        await PersistVerification(job.Reconstruction ?? recon, job.Hash, sol.ComputorId,
-            sol.TickNumber, epoch, "confirmed", fin?.Confirmations ?? job.Confirmations, verVer);
-        if (job.Reconstruction is not null) await WriteCache(job.Reconstruction, "distributed-network", overwrite: false);
+        await PersistVerification(recon, job.Hash, computorId,
+            tick, epoch, "confirmed", fin?.Confirmations ?? job.Confirmations, verVer, txTs);
+        await WriteCache(recon, "distributed-network", overwrite: false);
         return J(new { done = true, status = "confirmed", confirmations = fin?.Confirmations ?? job.Confirmations,
             genomeId = outcome.WinningGenomeId, verifiedScore = outcome.WinningScore, resolvedByReferee = false });
     }
@@ -965,11 +1040,24 @@ app.MapPost("/api/jobs/{id}/result", async (string id, HttpRequest req) =>
     // recompute) is authoritative. Whoever matches it is correct; dissenters are flagged and
     // their reputation is decremented (handled in Finalize). Determinism makes the verdict
     // independently re-derivable — trust comes from reproducibility, not from trusting a worker.
-    if (!Registry.IsSupported(epoch))
-        return Err(422, new { error = "epoch_unsupported", epoch });
+    // If we can't run the referee (missing inputs or unsupported epoch), finalize by the majority
+    // genome anyway — the job must never stay stuck in "resolving".
+    if (!Registry.IsSupported(epoch) || miningSeed is null || computorPubKey is null || nonce is null)
+    {
+        var finM = queue.Finalize(id, outcome.WinningGenomeId!, outcome.WinningScore, passes, threshold, algorithm, resolvedByReferee: false);
+        await PersistVerification(recon, job.Hash, computorId, tick, epoch, "conflicted", finM?.Confirmations ?? 0, verVer, txTs);
+        Console.WriteLine($"[result] conflict on {job.Hash} finalized by majority (referee unavailable)");
+        return J(new { done = true, status = "conflicted", confirmations = finM?.Confirmations ?? 0, genomeId = outcome.WinningGenomeId, resolvedByReferee = false });
+    }
     JsonObject refObj;
-    try { refObj = await VerifyForEpoch(epoch!.Value, sol.MiningSeed, sol.ComputorPublicKey, sol.Nonce); }
-    catch (Exception e) { return Err(500, new { error = "referee_failed", detail = e.Message }); }
+    try { refObj = await VerifyForEpoch(epoch!.Value, miningSeed, computorPubKey, nonce); }
+    catch (Exception e)
+    {
+        var finE = queue.Finalize(id, outcome.WinningGenomeId!, outcome.WinningScore, passes, threshold, algorithm, resolvedByReferee: false);
+        await PersistVerification(recon, job.Hash, computorId, tick, epoch, "conflicted", finE?.Confirmations ?? 0, verVer, txTs);
+        Console.WriteLine($"[result] referee failed for {job.Hash}: {e.Message} — finalized by majority");
+        return J(new { done = true, status = "conflicted", confirmations = finE?.Confirmations ?? 0, genomeId = outcome.WinningGenomeId, resolvedByReferee = false });
+    }
     JsonNode refRecon = refObj;
     string refGenome = GenomeId.Compute(refRecon);
     long? refScore = NodeLong(refObj["score"]);
@@ -982,13 +1070,13 @@ app.MapPost("/api/jobs/{id}/result", async (string id, HttpRequest req) =>
     refObj["solutionHash"] = Sanitize(job.Hash);
     refObj["epoch"] = epoch;
     refObj["coreVersion"] = Registry.P.CoreVersion;
-    refObj["computorId"] = sol.ComputorId;
-    refObj["tickNumber"] = sol.TickNumber;
+    refObj["computorId"] = computorId;
+    refObj["tickNumber"] = tick;
     refObj["inputs"] = new JsonObject
     {
-        ["miningSeed"] = sol.MiningSeed,
-        ["computorPublicKey"] = sol.ComputorPublicKey,
-        ["nonce"] = sol.Nonce,
+        ["miningSeed"] = miningSeed,
+        ["computorPublicKey"] = computorPubKey,
+        ["nonce"] = nonce,
     };
 
     var finC = queue.Finalize(id, refGenome, refScore, refPasses, refThreshold, refAlgorithm,
@@ -999,8 +1087,8 @@ app.MapPost("/api/jobs/{id}/result", async (string id, HttpRequest req) =>
         Hash: job.Hash, WorkerId: "referee", GenomeId: refGenome, Score: (int)(refScore ?? 0),
         VerifierVersion: refVersion ?? "", At: DateTime.UtcNow, Signature: ""));
 
-    await PersistVerification(refRecon, job.Hash, sol.ComputorId, sol.TickNumber, epoch,
-        "conflicted", finC?.Confirmations ?? 0, refVersion);
+    await PersistVerification(refRecon, job.Hash, computorId, tick, epoch,
+        "conflicted", finC?.Confirmations ?? 0, refVersion, txTs);
     await WriteCache(refRecon, "referee-resolved", overwrite: true);
 
     var dissenters = (finC?.Results ?? new List<JobQueue.JobResult>())
@@ -1076,18 +1164,32 @@ if (Directory.Exists(webDist))
 // stay "unverified". Enqueue dedups active hashes; we skip proofs already confirmed in CH.
 {
     bool autoEnqueue = (Environment.GetEnvironmentVariable("ATLAS_AUTO_ENQUEUE") ?? "true") != "false";
-    int intervalMs = int.TryParse(Environment.GetEnvironmentVariable("ATLAS_AUTO_ENQUEUE_INTERVAL_MS"), out var ei) ? ei : 15000;
-    int batch = int.TryParse(Environment.GetEnvironmentVariable("ATLAS_AUTO_ENQUEUE_BATCH"), out var eb) ? eb : 12;
+    int intervalMs = int.TryParse(Environment.GetEnvironmentVariable("ATLAS_AUTO_ENQUEUE_INTERVAL_MS"), out var ei) ? ei : 2000;
     bool backfill = (Environment.GetEnvironmentVariable("ATLAS_BACKFILL") ?? "true") != "false";
-    int backfillBatch = int.TryParse(Environment.GetEnvironmentVariable("ATLAS_BACKFILL_BATCH"), out var bb) ? bb : 24;
-    int backfillIntervalMs = int.TryParse(Environment.GetEnvironmentVariable("ATLAS_BACKFILL_INTERVAL_MS"), out var bi) ? bi : 4000;
-    const int backfillTickScanCap = 300;   // ticks probed per cycle (bounds per-cycle RPC)
-    int backfillFetchThrottleMs = int.TryParse(Environment.GetEnvironmentVariable("ATLAS_BACKFILL_THROTTLE_MS"), out var bt) ? bt : 100;  // ~10 RPC/s ceiling for backfill
+    // The feed scales to demand: keep ~perWorker jobs buffered PER active worker so nobody starves,
+    // auto-tuning from a couple of workers to hundreds. minBuffer keeps a floor when few are online;
+    // maxPerCycle bounds the per-cycle RPC burst regardless of fleet size.
+    int backfillPerWorker = int.TryParse(Environment.GetEnvironmentVariable("ATLAS_BACKFILL_PER_WORKER"), out var bpw) ? bpw : 5;
+    int backfillMinBuffer = int.TryParse(Environment.GetEnvironmentVariable("ATLAS_BACKFILL_MIN"), out var bmn) ? bmn : 24;
+    int backfillMaxPerCycle = int.TryParse(Environment.GetEnvironmentVariable("ATLAS_BACKFILL_MAX_PER_CYCLE"), out var bmp) ? bmp : 256;
+    int backfillIntervalMs = int.TryParse(Environment.GetEnvironmentVariable("ATLAS_BACKFILL_INTERVAL_MS"), out var bi) ? bi : 1500;
+    int backfillTickScanCap = int.TryParse(Environment.GetEnvironmentVariable("ATLAS_BACKFILL_SCAN_CAP"), out var bsc) ? bsc : 3000;   // ticks probed per cycle
+    int backfillConcurrency = int.TryParse(Environment.GetEnvironmentVariable("ATLAS_BACKFILL_CONCURRENCY"), out var bcc) ? bcc : 32;   // parallel tick fetches (solutions are sparse per tick)
     long? backfillStartTick = long.TryParse(Environment.GetEnvironmentVariable("ATLAS_BACKFILL_START_TICK"), out var bst) ? bst : null;
     long? backfillCursor = backfillStartTick;   // persistent-ish in-memory cursor, walks DOWN
     long backfillFloor = 0;
-
-    // ---- LOOP A: current-epoch proofs (HIGH priority) — always fed first ----
+    int? backfillEpochTarget = null;            // epoch the backfill is currently sweeping
+    long backfillTargetPickedAt = 0;            // when that choice was last re-evaluated
+    // epoch -> lowest tick FULLY swept, mirrored from ClickHouse so a restart resumes instead of
+    // re-sweeping. Only ever moves DOWN. Ticks near the live tick are not marked (archive lag).
+    var backfillProgress = new System.Collections.Concurrent.ConcurrentDictionary<int, long>();
+    bool backfillProgressLoaded = false;
+    long backfillProgressSavedAt = 0;
+    const long backfillLiveMargin = 1000;       // don't mark ticks this close to live as complete
+    // ---- LOOP A: newest proofs (HIGH priority) — demand-driven firehose fill ----
+    // Pages the firehose (newest-first) and tops the queue up to the worker-scaled target with
+    // UNVERIFIED proofs. This is the reliable primary feeder: it always fills to demand regardless
+    // of what the historical backfill is doing, so 35 workers can't be starved by a slow LOOP B.
     if (autoEnqueue)
     {
         _ = Task.Run(async () =>
@@ -1097,26 +1199,41 @@ if (Directory.Exists(webDist))
             {
                 try
                 {
-                    var recent = (await rpc.ListSolutions(batch * 2, 0)).Items;
-                    if (recent.Count == 0) continue;
-                    var verdicts = store.Enabled
-                        ? await store.VerdictsForAsync(recent.Select(s => s.Hash).ToList()) : null;
+                    int active = queue.WorkersActive(60000);
+                    int target = Math.Max(backfillMinBuffer, active * backfillPerWorker);
+                    var (pending, leased) = queue.Load();
+                    feedState["activeWorkers"] = active; feedState["target"] = target;
+                    feedState["pending"] = pending; feedState["leased"] = leased;
+                    if (pending + leased >= target) continue;
                     int added = 0;
-                    foreach (var s in recent)
+                    for (int page = 0; page < 40; page++)          // up to ~4000 newest proofs
                     {
-                        if (added >= batch) break;
-                        if (verdicts != null && verdicts.ContainsKey(s.Hash)) continue;
-                        var (epoch, build) = await EpochBuildForTick(s.TickNumber);
-                        if (!Registry.IsSupported(epoch)) continue;
-                        queue.Enqueue(s.Hash, epoch, build, sol: s);   // high priority, inputs captured
-                        added++;
+                        (pending, leased) = queue.Load();
+                        if (pending + leased >= target) break;
+                        List<Solution> sols;
+                        try { sols = (await rpc.ListSolutions(100, page * 100)).Items; }
+                        catch { break; }
+                        if (sols.Count == 0) break;
+                        // Existence-only + memory-cached: re-scanning already-verified proofs (which is
+                        // most of what this loop sees) costs no ClickHouse query at all.
+                        var seen = await store.KnownHashesAsync(sols.Where(s => s.Hash != null).Select(s => s.Hash!));
+                        foreach (var s in sols)
+                        {
+                            if (string.IsNullOrEmpty(s.Hash)) continue;
+                            if (seen.Contains(s.Hash)) continue;
+                            var (epoch, build) = await EpochBuildForTick(s.TickNumber);
+                            if (!Registry.IsSupported(epoch)) continue;
+                            queue.Enqueue(s.Hash, epoch, build, sol: s);   // high priority, inputs captured
+                            added++;
+                        }
                     }
-                    if (added > 0) Console.WriteLine($"[auto-enqueue] +{added} current-epoch proofs queued");
+                    feedState["loopA_lastAdded"] = added;
+                    if (added > 0) Console.WriteLine($"[auto-enqueue] +{added} newest proofs (target {target}, {active} workers)");
                 }
                 catch (Exception e) { Console.WriteLine($"[auto-enqueue] {e.Message}"); }
             }
         });
-        Console.WriteLine($"[auto-enqueue] on — every {intervalMs}ms, up to {batch} proofs/cycle");
+        Console.WriteLine($"[auto-enqueue] on — demand-driven every {intervalMs}ms (fill to {backfillPerWorker}×workers)");
     }
 
     // ---- LOOP B: historical backfill (LOW priority) — fills spare capacity, tick desc ----
@@ -1132,57 +1249,188 @@ if (Directory.Exists(webDist))
                 try
                 {
                     var (pending, leased) = queue.Load();
-                    if (pending + leased >= backfillBatch * 2) continue;   // enough buffered — let it drain
+                    // Demand-driven target: keep ~perWorker jobs buffered per ACTIVE worker (min floor),
+                    // so the feed scales with the fleet. Add only up to the shortfall, capped per cycle.
+                    int active = queue.WorkersActive(60000);
+                    int target = Math.Max(backfillMinBuffer, active * backfillPerWorker);
+                    if (pending + leased >= target) continue;                 // enough buffered — let it drain
+                    int addTarget = Math.Min(backfillMaxPerCycle, target - (pending + leased));
 
                     var bounds = await epochMap.BoundariesAsync();
                     if (bounds.Count == 0) continue;
                     var supBounds = bounds.Where(b => Registry.IsSupported(b.Epoch)).ToList();
                     if (supBounds.Count == 0) continue;
                     backfillFloor = supBounds.Min(b => b.First);
-                    long currentEpochFirst = bounds[^1].First;
-                    if (backfillCursor is null || backfillCursor > currentEpochFirst - 1)
-                        backfillCursor = currentEpochFirst - 1;
-                    if (backfillCursor < backfillFloor)
+
+                    // Steer at the epoch with the most UNVERIFIED work rather than crawling down from
+                    // the live tick: LOOP A already verified the newest ticks, so a cursor walking that
+                    // region burns an RPC round-trip per tick and enqueues nothing. Jumping straight into
+                    // the densest unverified epoch is what keeps the fleet fed. Re-evaluated every 60s.
+                    long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    if (!backfillProgressLoaded)
                     {
-                        Console.WriteLine($"[backfill] history exhausted (floor tick {backfillFloor})");
+                        backfillProgressLoaded = true;
+                        var prog = store.Enabled ? await store.BackfillProgressAsync() : null;
+                        if (prog is not null)
+                        {
+                            foreach (var kv in prog) backfillProgress[kv.Key] = kv.Value;
+                            if (prog.Count > 0) Console.WriteLine($"[backfill] resumed sweep progress for {prog.Count} epoch(s)");
+                        }
+                    }
+                    if (backfillEpochTarget is null || nowMs - backfillTargetPickedAt > 60_000)
+                    {
+                        backfillTargetPickedAt = nowMs;
+                        var counts = store.Enabled ? await store.EpochCountsAsync() : null;
+                        int? best = null; long bestGap = 0;
+                        foreach (var b in supBounds)
+                        {
+                            // Already swept to the epoch's floor? Nothing left to pull here.
+                            if (backfillProgress.TryGetValue(b.Epoch, out var lowDone) && lowDone <= b.First) continue;
+                            if (!epochEstimates.TryGetValue(b.Epoch, out var est) || est <= 0) continue;
+                            long ver = counts is not null && counts.TryGetValue(b.Epoch, out var c) ? c.Verified : 0;
+                            long gap = est - ver;
+                            if (gap > bestGap) { bestGap = gap; best = b.Epoch; }
+                        }
+                        if (best is not null && best != backfillEpochTarget)
+                        {
+                            backfillEpochTarget = best;
+                            var tb = supBounds.First(b => b.Epoch == best.Value);
+                            // Resume just below where this epoch was last fully swept — NOT its top.
+                            backfillCursor = backfillProgress.TryGetValue(best.Value, out var resume)
+                                ? Math.Min(resume - 1, tb.Last) : tb.Last;
+                            Console.WriteLine($"[backfill] targeting epoch {best} (~{bestGap} unverified); cursor->{backfillCursor}" +
+                                              (backfillProgress.ContainsKey(best.Value) ? " (resumed)" : ""));
+                        }
+                    }
+
+                    // Confine the sweep to the target epoch so it stays in dense territory; when it runs
+                    // off the bottom, drop the target and the next cycle re-picks the neediest epoch.
+                    long walkFloor = backfillFloor;
+                    if (backfillEpochTarget is not null && supBounds.Any(b => b.Epoch == backfillEpochTarget.Value))
+                        walkFloor = supBounds.First(b => b.Epoch == backfillEpochTarget.Value).First;
+                    long liveTick = bounds[^1].Last;   // top of the CURRENT epoch (the live tick)
+                    if (backfillCursor is null || backfillCursor > liveTick) backfillCursor = liveTick;
+                    if (backfillCursor < walkFloor)
+                    {
+                        Console.WriteLine($"[backfill] epoch {backfillEpochTarget} swept to floor — re-picking target");
+                        backfillEpochTarget = null; backfillTargetPickedAt = 0;
                         continue;
+                    }
+
+                    int? EpochForTick(long t)
+                    {
+                        foreach (var b in bounds) if (t >= b.First && t <= b.Last) return b.Epoch;
+                        return null;
                     }
 
                     int addedH = 0, scanned = 0;
                     long tick = backfillCursor.Value;
+                    // Lowest tick whose solutions were ALL processed. The cursor may only advance past
+                    // fully-swept ticks — otherwise a cycle that stops on addTarget would skip the
+                    // remaining ticks and their proofs would never be enqueued.
+                    long lowestDone = backfillCursor.Value + 1;
                     int? lastEp = null; long lastTick = tick;
-                    while (addedH < backfillBatch && scanned < backfillTickScanCap && tick >= backfillFloor)
+                    while (addedH < addTarget && scanned < backfillTickScanCap && tick >= walkFloor)
                     {
-                        long t = tick; tick--; scanned++;
-                        int? ep = null;
-                        foreach (var b in bounds) if (t >= b.First && t <= b.Last) { ep = b.Epoch; break; }
-                        if (!Registry.IsSupported(ep)) continue;
-                        // Throttle: at most ~1 tick fetch per backfillFetchThrottleMs so this background
-                        // scan can't burst hundreds of requests at the public RPC and get us rate-limited
-                        // (which would cascade into failures for the live path too).
-                        await Task.Delay(backfillFetchThrottleMs);
-                        List<Solution> sols;
-                        try { sols = await rpc.SolutionsInTick(t); } catch { continue; }
-                        if (sols.Count == 0) continue;
-                        var verdicts = store.Enabled
-                            ? await store.VerdictsForAsync(sols.Where(s => s.Hash != null).Select(s => s.Hash!).ToList()) : null;
-                        foreach (var s in sols)
+                        // Solutions are sparse per tick, so fetch a batch of ticks CONCURRENTLY — that's
+                        // what lets the scan move fast enough to actually land on solution-bearing ticks.
+                        var batchTicks = new List<long>(backfillConcurrency);
+                        while (batchTicks.Count < backfillConcurrency && scanned < backfillTickScanCap && tick >= walkFloor)
                         {
-                            if (addedH >= backfillBatch) break;
-                            if (string.IsNullOrEmpty(s.Hash)) continue;
-                            if (verdicts != null && verdicts.ContainsKey(s.Hash)) continue;
-                            queue.Enqueue(s.Hash, ep, Registry.BuildForEpoch(ep!.Value), low: true, sol: s);   // LOW priority, inputs captured
-                            addedH++; lastEp = ep; lastTick = t;
+                            long t = tick; tick--; scanned++;
+                            if (Registry.IsSupported(EpochForTick(t))) batchTicks.Add(t);
+                            else lowestDone = Math.Min(lowestDone, t);   // unsupported: nothing to sweep
+                        }
+                        if (batchTicks.Count == 0) continue;
+                        var fetched = await Task.WhenAll(batchTicks.Select(async t =>
+                        {
+                            try { return (t, await rpc.SolutionsInTick(t)); }
+                            catch { return (t, new List<Solution>()); }
+                        }));
+                        // Every tick in this batch is processed to completion (its RPC cost is already
+                        // paid). addedH may overshoot addTarget by at most one batch — harmless, since
+                        // the extra jobs are LOW priority and are work that must happen anyway.
+                        // ONE dedup lookup for the whole batch instead of one per tick: at 32 ticks
+                        // a batch that was 32 round-trips to ClickHouse for the same answer.
+                        var seen = await store.KnownHashesAsync(
+                            fetched.SelectMany(f => f.Item2).Where(s => s.Hash != null).Select(s => s.Hash!));
+                        foreach (var (t, sols) in fetched)
+                        {
+                            var ep = EpochForTick(t);
+                            if (sols.Count > 0)
+                            {
+                                foreach (var s in sols)
+                                {
+                                    if (string.IsNullOrEmpty(s.Hash)) continue;
+                                    if (seen.Contains(s.Hash)) continue;
+                                    queue.Enqueue(s.Hash, ep, Registry.BuildForEpoch(ep!.Value), low: true, sol: s);   // LOW priority
+                                    addedH++; lastEp = ep; lastTick = t;
+                                }
+                            }
+                            lowestDone = Math.Min(lowestDone, t);   // fully swept — safe to advance past
                         }
                     }
-                    backfillCursor = tick;
+                    // Resume just below the lowest FULLY swept tick — never past unprocessed work.
+                    backfillCursor = lowestDone - 1;
+
+                    // Persist the low-water mark so a restart doesn't re-sweep. Ticks within
+                    // backfillLiveMargin of the live tick are left unmarked: the archive can still be
+                    // indexing them, and marking early would strand proofs that appear afterwards.
+                    if (backfillEpochTarget is not null && lowestDone <= liveTick - backfillLiveMargin)
+                    {
+                        int ep = backfillEpochTarget.Value;
+                        long prev = backfillProgress.TryGetValue(ep, out var pv) ? pv : long.MaxValue;
+                        if (lowestDone < prev)
+                        {
+                            backfillProgress[ep] = lowestDone;
+                            if (nowMs - backfillProgressSavedAt > 15_000)   // throttle the CH write
+                            {
+                                backfillProgressSavedAt = nowMs;
+                                await store.SaveBackfillProgressAsync(ep, lowestDone);
+                            }
+                        }
+                    }
+
+                    feedState["loopB_cursor"] = backfillCursor; feedState["loopB_lastAdded"] = addedH;
+                    feedState["loopB_scanned"] = scanned; feedState["loopB_lastEpoch"] = lastEp;
+                    feedState["loopB_targetEpoch"] = backfillEpochTarget;
+                    feedState["loopB_sweptTo"] = backfillEpochTarget is not null
+                        && backfillProgress.TryGetValue(backfillEpochTarget.Value, out var sw) ? sw : null;
                     if (addedH > 0)
-                        Console.WriteLine($"[backfill] +{addedH} historical proofs (tick~{lastTick}, epoch {lastEp}); cursor->{backfillCursor}");
+                        Console.WriteLine($"[backfill] +{addedH} proofs (tick~{lastTick}, epoch {lastEp}); cursor->{backfillCursor}");
                 }
                 catch (Exception e) { Console.WriteLine($"[backfill] {e.Message}"); }
             }
         });
-        Console.WriteLine($"[backfill] on — every {backfillIntervalMs}ms, up to {backfillBatch} proofs/cycle (low priority)");
+        Console.WriteLine($"[backfill] on — every {backfillIntervalMs}ms, ~{backfillPerWorker} jobs buffered per active worker (min {backfillMinBuffer}, max {backfillMaxPerCycle}/cycle, low priority)");
+    }
+
+    // ---- LOOP C: per-epoch coverage estimate (density sampling), refreshed slowly ----
+    // Populates epochEstimates so /api/epochs can report ~total solutions and coverage. Cheap and
+    // staggered: a handful of RPC probes per epoch, once at startup then periodically.
+    bool estimateCoverage = (Environment.GetEnvironmentVariable("ATLAS_ESTIMATE_COVERAGE") ?? "true") != "false";
+    if (estimateCoverage)
+    {
+        _ = Task.Run(async () =>
+        {
+            var timer = new PeriodicTimer(TimeSpan.FromMinutes(15));
+            do
+            {
+                try
+                {
+                    var bounds = await epochMap.BoundariesAsync();
+                    // Current epoch first (most relevant), then older ones.
+                    foreach (var b in bounds.Where(x => Registry.IsSupported(x.Epoch)).OrderByDescending(x => x.Epoch))
+                    {
+                        epochEstimates[b.Epoch] = await EstimateEpochSolutionsAsync(b.First, b.Last);
+                        await Task.Delay(400);   // stagger between epochs so we don't burst the RPC
+                    }
+                }
+                catch (Exception e) { Console.WriteLine($"[estimate] {e.Message}"); }
+            }
+            while (await timer.WaitForNextTickAsync());
+        });
+        Console.WriteLine("[estimate] on — per-epoch coverage estimate every 15m");
     }
 }
 

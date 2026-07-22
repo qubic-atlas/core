@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from "vue";
+import { ref, computed, watch, onMounted, onBeforeUnmount } from "vue";
 import { api, short, fmt } from "../api.js";
 import { t } from "../i18n.js";
 
@@ -20,12 +20,23 @@ const load = () => Promise.all([
     .catch(() => { if (live) boardPending.value = true; }),
 ]);
 
-const acc = (v) => (v.verifications ? Math.round((v.correct / v.verifications) * 100) : 0);
+// Accuracy = agreement among proofs that actually reached consensus (decided), NOT among all
+// submissions — a proof still pending consensus is neither right nor wrong for the worker.
+const acc = (v) => (v.decided ? Math.round((v.correct / v.decided) * 100) : (v.verifications ? 100 : 0));
 
 onMounted(() => { load(); timer = setInterval(load, 4000); });
 onBeforeUnmount(() => { live = false; clearInterval(timer); });
 
 const statusChip = (s) => (s === "confirmed" ? "ok" : s === "conflicted" ? "no" : s === "resolving" ? "pending" : "");
+
+// Worker list paging (client-side) — stays sane when hundreds of workers connect.
+const W_PER = 20;
+const wPage = ref(0);
+const workerCount = computed(() => jstats.value?.workers?.length || 0);
+const wPages = computed(() => Math.max(1, Math.ceil(workerCount.value / W_PER)));
+const pagedWorkers = computed(() => (jstats.value?.workers || []).slice(wPage.value * W_PER, wPage.value * W_PER + W_PER));
+// Clamp the page if the worker count shrinks (workers dropping off).
+watch(wPages, (n) => { if (wPage.value >= n) wPage.value = Math.max(0, n - 1); });
 </script>
 
 <template>
@@ -38,33 +49,31 @@ const statusChip = (s) => (s === "confirmed" ? "ok" : s === "conflicted" ? "no" 
   </div>
 
   <div class="banner ok banner--info">
-    <b>How it stays honest:</b> the scorer is <b>deterministic</b>, so each Proof has exactly one correct genome. Workers must
-    agree on the <b>genome hash</b> to confirm it; a disagreement is settled by a <b>referee re-compute</b> (authoritative,
-    because anyone can re-derive the answer), and dissenting workers lose reputation until they're excluded.
+    <b>{{ t("pages.network.honestLabel") }}</b> <span v-html="t('pages.network.honestBody')"></span>
   </div>
 
   <!-- headline stats -->
   <div class="stats stats--live">
-    <div class="stat"><div class="k">Proofs verified</div><div class="v">{{ vstats ? fmt(vstats.verified) : "—" }}</div></div>
-    <div class="stat"><div class="k">Confirmed</div><div class="v good">{{ vstats ? fmt(vstats.confirmed) : "—" }}</div></div>
-    <div class="stat"><div class="k">Conflicted</div><div class="v" :class="{ bad: vstats && vstats.conflicted }">{{ vstats ? fmt(vstats.conflicted) : "—" }}</div></div>
-    <div class="stat"><div class="k">Computors seen</div><div class="v">{{ vstats ? fmt(vstats.computors) : "—" }}</div></div>
-    <div class="stat"><div class="k">Workers online</div><div class="v accent-text">{{ jstats ? jstats.workersOnline : "—" }}</div></div>
-    <div class="stat"><div class="k">Confirmations required</div><div class="v">{{ jstats ? jstats.requiredConfirmations : "—" }}</div></div>
-    <div class="stat"><div class="k">Jobs done</div><div class="v">{{ jstats ? fmt(jstats.done) : "—" }}</div></div>
-    <div class="stat"><div class="k">Queue</div><div class="v">{{ jstats ? (jstats.pending + jstats.leased + (jstats.resolving||0)) : "—" }}</div></div>
+    <div class="stat"><div class="k">{{ t("pages.network.stVerified") }}</div><div class="v">{{ vstats ? fmt(vstats.verified) : "—" }}</div></div>
+    <div class="stat"><div class="k">{{ t("pages.network.stConfirmed") }}</div><div class="v good">{{ vstats ? fmt(vstats.confirmed) : "—" }}</div></div>
+    <div class="stat"><div class="k">{{ t("pages.network.stConflicted") }}</div><div class="v" :class="{ bad: vstats && vstats.conflicted }">{{ vstats ? fmt(vstats.conflicted) : "—" }}</div></div>
+    <div class="stat"><div class="k">{{ t("pages.network.stComputors") }}</div><div class="v">{{ vstats ? fmt(vstats.computors) : "—" }}</div></div>
+    <div class="stat"><div class="k">{{ t("pages.network.stWorkers") }}</div><div class="v accent-text">{{ jstats ? jstats.workersOnline : "—" }}</div></div>
+    <div class="stat"><div class="k">{{ t("pages.network.stConfReq") }}</div><div class="v">{{ jstats ? jstats.requiredConfirmations : "—" }}</div></div>
+    <div class="stat"><div class="k">{{ t("pages.network.stJobs") }}</div><div class="v">{{ jstats ? fmt(jstats.done) : "—" }}</div></div>
+    <div class="stat"><div class="k">{{ t("pages.network.stQueue") }}</div><div class="v">{{ jstats ? (jstats.pending + jstats.leased + (jstats.resolving||0)) : "—" }}</div></div>
   </div>
 
   <div class="net-stack">
     <!-- top contributors (donation-ready: each id is a Qubic address) -->
     <div class="panel table-wrap">
-      <h3 class="panel-h">Top contributors <span class="muted">· verifiers ranked by confirmed Proofs</span></h3>
+      <h3 class="panel-h">{{ t("pages.network.topContrib") }} <span class="muted">· {{ t("pages.network.topContribNote") }}</span></h3>
       <table>
-        <thead><tr><th>#</th><th>Verifier identity</th><th>Verified</th><th>Correct</th><th>Accuracy</th><th>Last active</th></tr></thead>
+        <thead><tr><th>#</th><th>{{ t("pages.network.lbId") }}</th><th>{{ t("pages.network.lbVerified") }}</th><th>{{ t("pages.network.lbCorrect") }}</th><th>{{ t("pages.network.lbAccuracy") }}</th><th>{{ t("pages.network.lbLastActive") }}</th></tr></thead>
         <tbody>
-          <tr v-if="boardPending"><td colspan="6" class="center muted">Leaderboard warming up — it appears once workers submit signed results.</td></tr>
-          <tr v-else-if="!board"><td colspan="6" class="center muted"><span class="spin" /> loading…</td></tr>
-          <tr v-else-if="!board.length"><td colspan="6" class="center muted">No verifiers yet — <router-link to="/run-verifier">run one</router-link>.</td></tr>
+          <tr v-if="boardPending"><td colspan="6" class="center muted">{{ t("pages.network.lbWarming") }}</td></tr>
+          <tr v-else-if="!board"><td colspan="6" class="center muted"><span class="spin" /> {{ t("common.loading") }}</td></tr>
+          <tr v-else-if="!board.length"><td colspan="6" class="center muted">{{ t("pages.network.lbNoneA") }}<router-link to="/run-verifier">{{ t("pages.network.lbRunOne") }}</router-link>.</td></tr>
           <tr v-for="v in board" :key="v.id">
             <td class="muted">{{ v.rank }}</td>
             <td class="mono">{{ short(v.id, 12) }}</td>
@@ -75,41 +84,46 @@ const statusChip = (s) => (s === "confirmed" ? "ok" : s === "conflicted" ? "no" 
           </tr>
         </tbody>
       </table>
-      <p class="muted panel-note">Each verifier is a Qubic identity — a payable address — so heavy contributors can be recognized and rewarded directly.</p>
+      <p class="muted panel-note">{{ t("pages.network.lbNote") }}</p>
     </div>
 
     <!-- workers -->
     <div class="panel table-wrap">
-      <h3 class="panel-h">Workers</h3>
+      <h3 class="panel-h">{{ t("pages.network.workersTitle") }} <span class="muted">· {{ fmt(workerCount) }} {{ t("pages.network.active") }}</span></h3>
       <table>
-        <thead><tr><th>Worker</th><th>Done</th><th>Agreed</th><th>Dissent</th><th>Rep.</th><th>Status</th></tr></thead>
+        <thead><tr><th>{{ t("pages.network.wWorker") }}</th><th>{{ t("pages.network.wDone") }}</th><th>{{ t("pages.network.wAgreed") }}</th><th>{{ t("pages.network.wDissent") }}</th><th>{{ t("pages.network.wRep") }}</th><th>{{ t("pages.network.wStatus") }}</th></tr></thead>
         <tbody>
-          <tr v-if="!jstats"><td colspan="6" class="center muted"><span class="spin" /> loading…</td></tr>
-          <tr v-else-if="!jstats.workers.length"><td colspan="6" class="center muted">No workers have checked in.</td></tr>
-          <tr v-for="w in jstats?.workers" :key="w.id">
+          <tr v-if="!jstats"><td colspan="6" class="center muted"><span class="spin" /> {{ t("common.loading") }}</td></tr>
+          <tr v-else-if="!jstats.workers.length"><td colspan="6" class="center muted">{{ t("pages.network.wNone") }}</td></tr>
+          <tr v-for="w in pagedWorkers" :key="w.id">
             <td class="mono">{{ short(w.id, 6) }}</td>
             <td>{{ fmt(w.completed) }}</td>
             <td class="good">{{ w.agreed }}</td>
             <td :class="w.disagreed ? 'bad' : 'muted'">{{ w.disagreed }}</td>
             <td :class="w.reputation < 0 ? 'bad' : 'muted'">{{ w.reputation }}</td>
             <td>
-              <span v-if="!w.trusted" class="chip no">excluded</span>
-              <span v-else-if="w.online" class="chip ok">online</span>
-              <span v-else class="chip pending">idle</span>
+              <span v-if="!w.trusted" class="chip no">{{ t("pages.network.wExcluded") }}</span>
+              <span v-else-if="w.online" class="chip ok">{{ t("pages.network.wOnline") }}</span>
+              <span v-else class="chip pending">{{ t("pages.network.wIdle") }}</span>
             </td>
           </tr>
         </tbody>
       </table>
+      <div v-if="wPages > 1" class="pagerow pagerow--compact">
+        <button :disabled="wPage === 0" @click="wPage--">←</button>
+        <span class="muted">{{ wPage + 1 }} / {{ wPages }}</span>
+        <button :disabled="wPage >= wPages - 1" @click="wPage++">→</button>
+      </div>
     </div>
 
     <!-- recent verifications -->
     <div class="panel table-wrap">
-      <h3 class="panel-h">Recent verifications</h3>
+      <h3 class="panel-h">{{ t("pages.network.recentTitle") }}</h3>
       <table>
-        <thead><tr><th>Proof</th><th>Genome</th><th>Score</th><th>Conf.</th><th>Status</th></tr></thead>
+        <thead><tr><th>{{ t("table.proof") }}</th><th>{{ t("pages.network.rGenome") }}</th><th>{{ t("pages.network.rScore") }}</th><th>{{ t("pages.network.rConf") }}</th><th>{{ t("table.status") }}</th></tr></thead>
         <tbody>
-          <tr v-if="!recent"><td colspan="5" class="center muted"><span class="spin" /> loading…</td></tr>
-          <tr v-else-if="!recent.length"><td colspan="5" class="center muted">No jobs yet.</td></tr>
+          <tr v-if="!recent"><td colspan="5" class="center muted"><span class="spin" /> {{ t("common.loading") }}</td></tr>
+          <tr v-else-if="!recent.length"><td colspan="5" class="center muted">{{ t("pages.network.rNone") }}</td></tr>
           <tr v-for="j in recent" :key="j.id">
             <td class="mono"><router-link :to="`/proofs/${j.hash}?auto=1`">{{ short(j.hash, 8) }}</router-link></td>
             <td class="mono muted">{{ j.genomeId ? short(j.genomeId, 6) : "—" }}</td>
@@ -117,7 +131,7 @@ const statusChip = (s) => (s === "confirmed" ? "ok" : s === "conflicted" ? "no" 
             <td>{{ j.confirmations }}</td>
             <td>
               <span class="chip" :class="statusChip(j.status)">{{ j.status }}</span>
-              <span v-if="j.resolvedByReferee" class="chip pending" title="settled by referee re-compute">referee</span>
+              <span v-if="j.resolvedByReferee" class="chip pending">{{ t("pages.network.rReferee") }}</span>
             </td>
           </tr>
         </tbody>
@@ -125,5 +139,5 @@ const statusChip = (s) => (s === "confirmed" ? "ok" : s === "conflicted" ? "no" 
     </div>
   </div>
 
-  <p v-if="err" class="banner no">Failed to load network data: {{ err }}</p>
+  <p v-if="err" class="banner no">{{ t("pages.network.failedNet") }}: {{ err }}</p>
 </template>

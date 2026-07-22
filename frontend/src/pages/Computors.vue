@@ -2,6 +2,7 @@
 import { ref, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import { api, short, fmt } from "../api.js";
+import { t } from "../i18n.js";
 
 const router = useRouter();
 const rows = ref(null);
@@ -13,14 +14,14 @@ onMounted(() => {
 </script>
 
 <template>
-  <h1>Computors</h1>
-  <p class="sub">Ranked by proofs our verifier network has confirmed. Identities are recovered from each proof transaction's source — click one for details.</p>
+  <h1>{{ t("pages.computors.title") }}</h1>
+  <p class="sub">{{ t("pages.computors.sub") }}</p>
   <div class="panel table-wrap">
     <table>
-      <thead><tr><th>#</th><th>Computor</th><th>Proofs</th><th>First tick</th><th>Last tick</th></tr></thead>
+      <thead><tr><th>#</th><th>{{ t("table.computor") }}</th><th>{{ t("table.proofs") }}</th><th>{{ t("table.firstTick") }}</th><th>{{ t("table.lastTick") }}</th></tr></thead>
       <tbody>
-        <tr v-if="err"><td colspan="5" class="center">Failed: {{ err }}</td></tr>
-        <tr v-else-if="!rows"><td colspan="5" class="center muted"><span class="spin" /> loading…</td></tr>
+        <tr v-if="err"><td colspan="5" class="center">{{ t("common.failed") }}: {{ err }}</td></tr>
+        <tr v-else-if="!rows"><td colspan="5" class="center muted"><span class="spin" /> {{ t("common.loading") }}</td></tr>
         <tr v-for="c in rows" v-else :key="c.computorId" class="click" @click="router.push(`/computors/${c.computorId}`)">
           <td class="muted">{{ c.rank }}</td>
           <td class="mono">{{ short(c.computorId, 12) }}</td>

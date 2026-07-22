@@ -1,16 +1,20 @@
 <script setup>
-import { ref, onMounted } from "vue";
+import { ref, onMounted, onBeforeUnmount } from "vue";
 import { api, fmt, FEATURED } from "../api.js";
 import { t } from "../i18n.js";
 import HeroNet from "../components/HeroNet.vue";
 
 const tick = ref(null);
-const idx = ref(null);
+const stats = ref(null);
+let timer = 0, live = true;
 
-onMounted(() => {
-  api.tick().then((d) => (tick.value = d.tickInfo)).catch(() => {});
-  api.indexStatus().then((d) => (idx.value = d)).catch(() => {});
-});
+const load = () => {
+  api.tick().then((d) => { if (live) tick.value = d.tickInfo; }).catch(() => {});
+  api.verificationsStats().then((d) => { if (live) stats.value = d; }).catch(() => {});
+};
+
+onMounted(() => { load(); timer = setInterval(load, 5000); });
+onBeforeUnmount(() => { live = false; clearInterval(timer); });
 </script>
 
 <template>
@@ -32,8 +36,8 @@ onMounted(() => {
   <div class="stats stats--live mb-26">
     <div class="stat"><div class="k">{{ t("pages.overview.statEpoch") }}</div><div class="v stat__v--accent">{{ tick ? tick.epoch : "—" }}</div></div>
     <div class="stat"><div class="k">{{ t("pages.overview.statTick") }}</div><div class="v">{{ tick ? fmt(tick.tick) : "—" }}</div></div>
-    <div class="stat"><div class="k">{{ t("pages.overview.statIndexed") }}</div><div class="v">{{ idx ? fmt(idx.indexedSolutions) : "—" }}</div></div>
-    <div class="stat"><div class="k">{{ t("pages.overview.statVerification") }}</div><div class="v stat__v--good">{{ t("pages.overview.byNetwork") }}</div></div>
+    <div class="stat"><div class="k">{{ t("pages.overview.statVerified") }}</div><div class="v">{{ stats ? fmt(stats.confirmed) : "—" }}</div></div>
+    <div class="stat"><div class="k">{{ t("pages.overview.statRate") }}</div><div class="v stat__v--good">{{ stats ? fmt(stats.ratePerMin) + " " + t("pages.overview.perMin") : "—" }}</div></div>
   </div>
 
   <!-- concept -->

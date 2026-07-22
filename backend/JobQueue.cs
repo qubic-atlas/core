@@ -56,8 +56,10 @@ public sealed class JobQueue
         // hash alone (e.g. POST /api/jobs/enqueue) — those fall back to an RPC fetch on claim.
         public string? MiningSeed { get; set; }
         public string? ComputorPublicKey { get; set; }
+        public string? ComputorId { get; set; }
         public string? Nonce { get; set; }
         public long? TickNumber { get; set; }
+        public object? Timestamp { get; set; }   // proof's on-chain time (ms), for "when" display
         // The last full reconstruction submitted (written to the verify cache on done).
         public JsonNode? Reconstruction { get; set; }
     }
@@ -73,9 +75,17 @@ public sealed class JobQueue
 
     private readonly Dictionary<string, Job> _jobs = new();
     private readonly Dictionary<string, string> _byHash = new();
-    private readonly Queue<string> _pending = new();      // current-epoch (high priority)
+    // Jobs that already have ≥1 result and just need another DISTINCT worker to reach consensus.
+    // Served before any fresh work so a proof's N confirmations happen back-to-back instead of the
+    // partially-done job sinking to the back of the queue behind every newly-enqueued proof.
+    private readonly Queue<string> _pendingCorroborate = new();
+    private readonly Queue<string> _pending = new();      // current-epoch, not yet started (high)
     private readonly Queue<string> _pendingLow = new();   // historical backfill (low priority)
     private readonly Dictionary<string, WorkerInfo> _workers = new();
+    // Done jobs are kept briefly (status polling / Recent()) then evicted so _jobs stays bounded.
+    // Without this, every finalized job — with its ~200KB reconstruction — accumulated forever.
+    private readonly Queue<string> _doneOrder = new();
+    private const int MaxDoneRetained = 1000;
     private int _seq;
     private readonly object _lock = new();
 
@@ -114,13 +124,38 @@ public sealed class JobQueue
 
     private void Requeue(Job job) => (job.Low ? _pendingLow : _pending).Enqueue(job.Id);
 
+    // Retire a job to the bounded done-set: drop its heavy reconstruction blob immediately (it's
+    // already persisted to ClickHouse + the verify cache), then evict the oldest done jobs so the
+    // in-memory dictionary can't grow without bound as millions of proofs are verified.
+    private void RetireDone(Job job)
+    {
+        job.Reconstruction = null;
+        _doneOrder.Enqueue(job.Id);
+        while (_doneOrder.Count > MaxDoneRetained)
+        {
+            var oldId = _doneOrder.Dequeue();
+            if (_jobs.TryGetValue(oldId, out var oj) && oj.Status == "done") _jobs.Remove(oldId);
+        }
+    }
+
+    // Re-queue a job to the right lane: one that already has a partial result goes to the
+    // corroboration lane (served first) so it reaches consensus quickly; a fresh job goes to its
+    // normal high/low lane. Used everywhere a job returns to the queue after being handed out.
+    private void RequeueSmart(Job job)
+    {
+        if (job.Results.Count > 0) _pendingCorroborate.Enqueue(job.Id);
+        else Requeue(job);
+    }
+
     // Store the proof inputs on a job so claim can serve it without an RPC fetch.
     private static void StoreInputs(Job j, Solution s)
     {
         j.MiningSeed = s.MiningSeed;
         j.ComputorPublicKey = s.ComputorPublicKey;
+        j.ComputorId = s.ComputorId;
         j.Nonce = s.Nonce;
         j.TickNumber = s.TickNumber;
+        j.Timestamp = s.Timestamp;
         if (string.IsNullOrEmpty(j.Algorithm)) j.Algorithm = s.Algorithm;
     }
 
@@ -159,8 +194,18 @@ public sealed class JobQueue
                 job.Status = "pending";
                 job.LeasedTo = null;
                 job.LeaseExpiry = 0;
-                Requeue(job);
+                RequeueSmart(job);
             }
+        }
+    }
+
+    // Number of workers seen within the given window — lets the backfill scale its feed to demand.
+    public int WorkersActive(long windowMs)
+    {
+        lock (_lock)
+        {
+            var now = Now();
+            return _workers.Count(kv => now - kv.Value.LastSeen < windowMs);
         }
     }
 
@@ -182,15 +227,25 @@ public sealed class JobQueue
     private void Reap()
     {
         var now = Now();
+        List<Job>? reaped = null;
         foreach (var job in _jobs.Values)
         {
             if (job.Status == "leased" && job.LeaseExpiry < now)
             {
                 job.Status = "pending";
                 job.LeasedTo = null;
-                Requeue(job);
+                RequeueSmart(job);   // expired lease on an in-progress job → back to the fast lane
+            }
+            // Safety net: a job that reached consensus but was never finalized (caller crashed
+            // mid-flight) must not linger in "resolving" forever — retire it so it can't pile up.
+            else if (job.Status == "resolving" && job.LeaseExpiry != 0 && job.LeaseExpiry < now)
+            {
+                job.Status = "done";
+                (reaped ??= new()).Add(job);
             }
         }
+        // Retire outside the enumeration — RetireDone mutates _jobs.
+        if (reaped != null) foreach (var j in reaped) RetireDone(j);
     }
 
     // True when the worker is trusted enough to receive new work.
@@ -212,8 +267,9 @@ public sealed class JobQueue
 
             var skipped = new List<Job>();
             Job? picked = null;
-            // High-priority (current epoch) first, then low-priority (historical backfill).
-            foreach (var q in new[] { _pending, _pendingLow })
+            // Corroboration lane first (finish in-progress consensus), then current epoch, then
+            // historical backfill.
+            foreach (var q in new[] { _pendingCorroborate, _pending, _pendingLow })
             {
                 while (q.Count > 0)
                 {
@@ -233,7 +289,7 @@ public sealed class JobQueue
                 }
                 if (picked is not null) break;
             }
-            foreach (var s in skipped) Requeue(s);
+            foreach (var s in skipped) RequeueSmart(s);   // keep in-progress jobs in the fast lane
             return picked;
         }
     }
@@ -295,6 +351,7 @@ public sealed class JobQueue
             {
                 job.Status = "resolving";
                 job.LeasedTo = null;
+                job.LeaseExpiry = Now() + 120000;   // finalize deadline (reaped if the caller never finalizes)
                 return new SubmitOutcome(job, true, ConsensusState.Conflicted, bestGenome, ScoreOf(job, bestGenome));
             }
 
@@ -303,13 +360,15 @@ public sealed class JobQueue
             {
                 job.Status = "resolving";
                 job.LeasedTo = null;
+                job.LeaseExpiry = Now() + 120000;   // finalize deadline (reaped if the caller never finalizes)
                 return new SubmitOutcome(job, true, ConsensusState.Confirmed, bestGenome, ScoreOf(job, bestGenome));
             }
 
-            // Not enough corroboration yet — re-open so another distinct worker can weigh in.
+            // Not enough corroboration yet — re-open in the FAST lane so another distinct worker
+            // finishes it immediately, instead of it sinking behind freshly-enqueued proofs.
             job.Status = "pending";
             job.LeasedTo = null;
-            Requeue(job);
+            RequeueSmart(job);
             return new SubmitOutcome(job, true, ConsensusState.Pending, bestGenome, ScoreOf(job, bestGenome));
         }
     }
@@ -348,6 +407,7 @@ public sealed class JobQueue
             job.Agreed = !anyDissent;
             job.ResolvedByReferee = resolvedByReferee;
             _byHash.Remove(job.Hash);
+            RetireDone(job);
             return job;
         }
     }
@@ -373,16 +433,25 @@ public sealed class JobQueue
                 }
             }
             var now = Now();
-            var workers = _workers.Select(kv => new
-            {
-                id = kv.Key,
-                completed = kv.Value.Completed,
-                agreed = kv.Value.Agreed,
-                disagreed = kv.Value.Disagreed,
-                reputation = kv.Value.Reputation,
-                trusted = kv.Value.Reputation >= _minReputation,
-                online = now - kv.Value.LastSeen < 30000,
-            }).ToList();
+            const long activeWindowMs = 120_000;    // 2 min: a worker idle longer drops off the list
+            const long forgetMs = 3_600_000;        // 1 h: gone this long → forgotten entirely (frees memory)
+            // Memory hygiene: ephemeral worker identities (workers without a persisted key regenerate
+            // on restart) accumulate forever otherwise. Drop the long-gone ones.
+            foreach (var k in _workers.Where(kv => now - kv.Value.LastSeen > forgetMs).Select(kv => kv.Key).ToList())
+                _workers.Remove(k);
+            var workers = _workers
+                .Where(kv => now - kv.Value.LastSeen < activeWindowMs)   // only recently-active workers
+                .OrderByDescending(kv => kv.Value.LastSeen)
+                .Select(kv => new
+                {
+                    id = kv.Key,
+                    completed = kv.Value.Completed,
+                    agreed = kv.Value.Agreed,
+                    disagreed = kv.Value.Disagreed,
+                    reputation = kv.Value.Reputation,
+                    trusted = kv.Value.Reputation >= _minReputation,
+                    online = now - kv.Value.LastSeen < 30000,   // "live" (green) vs merely recently-active
+                }).ToList();
             return new
             {
                 pending,
@@ -394,7 +463,7 @@ public sealed class JobQueue
                 expectedVerifierVersion = ExpectedVersion,
                 minReputation = _minReputation,
                 workers,
-                workersOnline = workers.Count(x => x.online),
+                workersOnline = workers.Count,
             };
         }
     }

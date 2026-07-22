@@ -51,6 +51,7 @@ import { t } from "../i18n.js";
       <li v-html="t('pages.docs.rm2')"></li>
       <li v-html="t('pages.docs.rm3')"></li>
       <li v-html="t('pages.docs.rm4')"></li>
+      <li v-html="t('pages.docs.rm5')"></li>
     </ul>
     <p>
       <a href="https://github.com/qubic-atlas/core/blob/main/ROADMAP.md" target="_blank" rel="noopener">{{ t("pages.docs.roadmapCta") }}</a>

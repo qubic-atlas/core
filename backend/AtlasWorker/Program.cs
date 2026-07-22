@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
@@ -76,7 +77,12 @@ else
 }
 
 var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
-Console.WriteLine($"[atlas-worker] id={workerId} atlas={atlasUrl} verifier={verifierPath} signed={signEnabled} once={once}");
+// Keep a warm verifier process per build: it caches the ~512MB seed pool and only regenerates it
+// when the miningSeed changes, so same-seed proofs skip the ~610ms pool-gen (~94% of compute).
+// Falls back to one-shot spawns automatically for any binary that doesn't support --serve.
+var serve = EnvBool("WORKER_SERVE", true);
+var daemons = new ConcurrentDictionary<string, VerifierDaemon>();
+Console.WriteLine($"[atlas-worker] id={workerId} atlas={atlasUrl} verifier={verifierPath} signed={signEnabled} serve={serve} once={once}");
 
 static bool ValidSeed(string s) => s.Length == 55 && s.All(c => c >= 'a' && c <= 'z');
 
@@ -214,7 +220,19 @@ async Task<bool> Tick()
     Console.WriteLine($"[atlas-worker] claimed {jobId} ({claim["algorithm"]}) epoch={claim["epoch"]} build={build} hash={claim["hash"]}");
     try
     {
-        var recon = await RunVerifier(binaryPath, seed, pk, nonce);
+        JsonNode? recon;
+        if (serve)
+        {
+            var daemon = daemons.GetOrAdd(build, _ => new VerifierDaemon(binaryPath));
+            recon = await daemon.Run(seed, pk, nonce, 120000);
+            // A binary lacking --serve is detected once, then this build always one-shots.
+            if (daemon.Unsupported) recon = await RunVerifier(binaryPath, seed, pk, nonce);
+        }
+        else recon = await RunVerifier(binaryPath, seed, pk, nonce);
+
+        if (recon is null) { Console.WriteLine($"[atlas-worker] no result for {jobId} — leaving claimable"); return false; }
+        if (recon["error"] is not null) { Console.WriteLine($"[atlas-worker] verifier error for {jobId}: {recon["error"]}"); return false; }
+
         var payload = new JsonObject { ["worker"] = workerId };
 
         if (signEnabled && keySeed is not null && recon is not null)
@@ -251,4 +269,96 @@ while (true)
 {
     var did = await Tick();
     if (!did) await Task.Delay(pollMs);
+}
+
+// A long-lived verifier process in --serve mode. It holds the ~512MB seed pool in memory and only
+// rebuilds it when the miningSeed changes — so a run of same-seed proofs pays the ~610ms pool-gen
+// once instead of per proof. One instance per build (build0..build3); requests are serialized.
+// If the binary doesn't support --serve (exits immediately), Unsupported latches true and the
+// caller permanently falls back to one-shot spawns for that build.
+sealed class VerifierDaemon
+{
+    readonly string _path;
+    readonly SemaphoreSlim _gate = new(1, 1);
+    Process? _proc;
+    public bool Unsupported { get; private set; }
+
+    public VerifierDaemon(string path) { _path = path; }
+
+    public async Task<JsonNode?> Run(string seed, string pk, string nonce, int timeoutMs)
+    {
+        if (Unsupported) return null;   // caller one-shots instead
+        await _gate.WaitAsync();
+        try
+        {
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                if (_proc is null || _proc.HasExited)
+                {
+                    if (!Start()) { Unsupported = true; return null; }
+                }
+                try
+                {
+                    await _proc!.StandardInput.WriteLineAsync($"{seed} {pk} {nonce} -1");
+                    await _proc.StandardInput.FlushAsync();
+                    using var cts = new CancellationTokenSource(timeoutMs);
+                    var sb = new StringBuilder();
+                    while (true)
+                    {
+                        var line = await _proc.StandardOutput.ReadLineAsync(cts.Token);
+                        if (line is null) throw new IOException("verifier daemon closed stdout");
+                        if (line == "__ATLAS_EOF__") return JsonNode.Parse(sb.ToString().Trim());
+                        sb.Append(line).Append('\n');
+                    }
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine($"[atlas-worker] daemon {System.IO.Path.GetFileName(_path)} error: {e.Message} (attempt {attempt + 1})");
+                    try { if (_proc is { HasExited: false }) _proc.Kill(true); } catch { }
+                    _proc = null;   // restart on next attempt; a second immediate failure gives up (→ null)
+                }
+            }
+            return null;
+        }
+        finally { _gate.Release(); }
+    }
+
+    bool Start()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = _path,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            psi.ArgumentList.Add("--serve");
+            var p = Process.Start(psi);
+            if (p is null) return false;
+            _proc = p;
+            // Drain stderr so it can't fill the pipe and wedge the child; surface its lines.
+            _ = Task.Run(async () =>
+            {
+                try { string? l; while ((l = await p.StandardError.ReadLineAsync()) is not null) Console.WriteLine($"[verifier:{System.IO.Path.GetFileName(_path)}] {l}"); }
+                catch { }
+            });
+            // A binary without --serve prints usage and exits immediately; detect that here.
+            Thread.Sleep(60);
+            if (p.HasExited)
+            {
+                Console.WriteLine($"[atlas-worker] {System.IO.Path.GetFileName(_path)} exited on --serve (code {p.ExitCode}) — no serve support, using one-shot");
+                _proc = null;
+                return false;
+            }
+            return true;
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"[atlas-worker] cannot start daemon {_path}: {e.Message}");
+            return false;
+        }
+    }
 }

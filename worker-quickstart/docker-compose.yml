@@ -1,11 +1,30 @@
 # Run one or more Qubic Atlas verifier workers on your machine.
-#   docker compose -f worker-quickstart/docker-compose.yml up -d --scale worker=4
-# Point ATLAS_URL at the public Atlas API. Workers are outbound-only (NAT-friendly).
+#
+# The worker count is set by deploy.replicas below (honored by `docker compose up` in Compose v2,
+# no Swarm needed). Just:
+#   docker compose -f worker-quickstart/docker-compose.yml up -d
+# Override without editing the file:
+#   WORKER_REPLICAS=8 docker compose -f worker-quickstart/docker-compose.yml up -d
+#   docker compose -f worker-quickstart/docker-compose.yml up -d --scale worker=8   # (CLI wins)
+#
+# More workers = faster confirmation + more history covered. Each replica gets its own distinct,
+# persistent Qubic identity — required because N-of-M consensus only counts DIFFERENT verifiers
+# agreeing. Workers are outbound-only (NAT-friendly); there are no ports to open.
 services:
   worker:
     image: qubiclab/atlas-worker:latest
-    # Atlas URL (https://qubic-atlas.org) is baked into the image — no config needed.
-    # To point at a self-hosted Atlas, uncomment:
-    # environment:
-    #   ATLAS_URL: "https://your-host"
+    # The Atlas URL (https://qubic-atlas.org) is baked into the image — no config needed.
+    environment:
+      # {host} expands to each replica's container id, so replicas sharing the volume below still
+      # get distinct, persisted identities (reputation survives restarts).
+      ATLAS_KEY_FILE: "/data/worker-{host}.key"
+      # To point at a self-hosted Atlas instead of the public one, uncomment:
+      # ATLAS_URL: "https://your-host"
+    volumes:
+      - worker-keys:/data
     restart: unless-stopped
+    deploy:
+      replicas: ${WORKER_REPLICAS:-4}
+
+volumes:
+  worker-keys:
