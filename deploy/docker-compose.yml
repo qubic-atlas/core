@@ -1,0 +1,87 @@
+# Qubic Atlas — production deployment from Docker Hub (qubiclab/atlas-*),
+# served ONLY through a Cloudflare Tunnel. Nothing is published on the host:
+# the only ingress is cloudflared's outbound connection to Cloudflare, which
+# proxies your public hostname -> http://frontend:80 on this private network.
+#
+# Setup:
+#   1) In Cloudflare Zero Trust → Networks → Tunnels, create a tunnel and add a
+#      Public Hostname:  qubic-atlas.org  ->  Service: http://frontend:80
+#   2) Copy the tunnel token into .env  (CF_TUNNEL_TOKEN=...)   see .env.example
+#   3) docker compose up -d          (scale verifiers: docker compose up -d --scale worker=4)
+name: qubic-atlas
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    environment:
+      CLICKHOUSE_DB: atlas
+      # Newer clickhouse-server disables the passwordless `default` user over the network
+      # (REQUIRED_PASSWORD) — which broke persistence. Setting a password makes the entrypoint
+      # ENABLE network access for `default` with it, written to /etc config on every start — so it
+      # works on your EXISTING data volume with no recreation. The API uses the same value below.
+      # Override both via .env (CLICKHOUSE_PASSWORD=...). ClickHouse is never exposed outside the
+      # private compose network.
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-atlas}"
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--password", "${CLICKHOUSE_PASSWORD:-atlas}", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  api:
+    image: qubiclab/atlas-api:latest
+    environment:
+      QUBIC_RPC: "${QUBIC_RPC:-https://rpc.qubic.org}"
+      CLICKHOUSE_URL: "http://clickhouse:8123"
+      CLICKHOUSE_DB: "atlas"
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-atlas}"   # connect to CH as default with this password
+      ATLAS_CONFIRMATIONS: "${ATLAS_CONFIRMATIONS:-2}"
+      ATLAS_REQUIRE_SIGNED: "${ATLAS_REQUIRE_SIGNED:-true}"
+      # ATLAS_WORKER_ALLOWLIST: ""      # set to comma-separated identities for permissioned mode
+      VERIFIER: "/usr/local/bin/verifier"
+      PORT: "8099"
+    volumes:
+      - api-cache:/app/.cache
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    image: qubiclab/atlas-worker:latest
+    environment:
+      ATLAS_URL: "http://api:8099"          # internal; the baked-in default is the public URL
+      ATLAS_KEY_FILE: "/data/worker-{host}.key"   # distinct persistent identity per replica
+    volumes:
+      - worker-keys:/data
+    depends_on:
+      - api
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
+    restart: unless-stopped
+
+  frontend:
+    image: qubiclab/atlas-frontend:latest
+    environment:
+      ATLAS_UPSTREAM: "api:8099"            # nginx proxies /api/ -> api
+    depends_on:
+      - api
+    restart: unless-stopped
+    # NOTE: intentionally no `ports:` — reachable only via the tunnel.
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN}
+    depends_on:
+      - frontend
+    restart: unless-stopped
+
+volumes:
+  clickhouse-data:
+  api-cache:
+  worker-keys:

@@ -1,0 +1,24 @@
+# Local test of the DEPLOY stack — build from source instead of pulling Docker Hub,
+# expose the app on http://localhost:8080, and skip the Cloudflare tunnel.
+#
+#   # 1) build the verifier image once (api/worker bake in its binary):
+#   docker build -t qubic-atlas/verifier:latest ../scorer
+#   # 2) bring the stack up locally:
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+#   # open http://localhost:8080   (stop the root stack first if :8080 is taken)
+services:
+  api:
+    build: ../backend
+    pull_policy: build
+  worker:
+    build:
+      context: ../backend
+      dockerfile: AtlasWorker/Dockerfile
+    pull_policy: build
+  frontend:
+    build: ../frontend
+    pull_policy: build
+    ports:
+      - "8080:80"          # exposed locally instead of via the tunnel
+  cloudflared:
+    profiles: ["tunnel"]   # excluded from a default `up` (no tunnel locally)

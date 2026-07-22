@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>QubicAtlas</RootNamespace>
+    <AssemblyName>QubicAtlas</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- The worker is a sibling project in a subfolder; keep it out of this project's compile set. -->
+  <ItemGroup>
+    <Compile Remove="AtlasWorker/**/*.cs" />
+    <Content Remove="AtlasWorker/**" />
+    <None Remove="AtlasWorker/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Qubic.Crypto" Version="1.5.2" />
+    <PackageReference Include="ClickHouse.Client" Version="7.14.0" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,11 @@
+# Run one or more Qubic Atlas verifier workers on your machine.
+#   docker compose -f worker-quickstart/docker-compose.yml up -d --scale worker=4
+# Point ATLAS_URL at the public Atlas API. Workers are outbound-only (NAT-friendly).
+services:
+  worker:
+    image: qubiclab/atlas-worker:latest
+    # Atlas URL (https://qubic-atlas.org) is baked into the image — no config needed.
+    # To point at a self-hosted Atlas, uncomment:
+    # environment:
+    #   ATLAS_URL: "https://your-host"
+    restart: unless-stopped

@@ -1,0 +1,99 @@
+# Qubic Atlas — full stack.
+#   verifier  : C++ Qubic Core scorer, baked into the api + worker images (not a long-running service)
+#   api       : ASP.NET Core backend (RPC/archive, verify, job queue) — serves /api
+#   worker    : distributed Atlas Verifier client(s) — claim jobs, recompute, submit results (scale freely)
+#   frontend  : Vue 3 SPA behind nginx, proxying /api -> api
+#
+# Build order matters (api/worker COPY the verifier binary from the verifier image):
+#   docker build -t qubic-atlas/verifier:latest ./scorer
+#   docker compose build && docker compose up
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    environment:
+      CLICKHOUSE_DB: "atlas"
+      # Newer clickhouse-server disables the passwordless `default` user over the network; setting a
+      # password makes the entrypoint enable network access for `default` with it (config written on
+      # every start, so it works on an existing data volume). The api uses the same value below.
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-atlas}"
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--password", "${CLICKHOUSE_PASSWORD:-atlas}", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  api:
+    build: ./backend
+    image: qubic-atlas/api:latest
+    environment:
+      QUBIC_RPC: "https://rpc.qubic.org"
+      # N-of-M consensus: 2 workers must agree on the genome_id before a proof is confirmed,
+      # so the conflict/referee path is actually exercised (the design also supports 1).
+      ATLAS_CONFIRMATIONS: "2"
+      VERIFIER: "/usr/local/bin/verifier"
+      PORT: "8099"
+      CLICKHOUSE_URL: "http://clickhouse:8123"
+      CLICKHOUSE_DB: "atlas"
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-atlas}"
+      # Pin the trusted verifier build: results from any other reconstructorVersion are
+      # recorded for audit but do not count toward confirmation.
+      ATLAS_VERIFIER_VERSION: "qubic-atlas-verify-1"
+      # Worker authentication: every result submission must be signed by the worker's Qubic
+      # keypair and verified server-side (see backend/AUTH.md). Set false only for testing.
+      ATLAS_REQUIRE_SIGNED: "true"
+      # Permissioned mode (optional): comma-separated Qubic identities. Unset => open/permissionless
+      # (any validly-signed identity accepted). Or point ATLAS_WORKER_ALLOWLIST_FILE at a file.
+      # ATLAS_WORKER_ALLOWLIST: "IDENTITY_A,IDENTITY_B"
+    volumes:
+      - atlas-cache:/app/.cache
+    expose:
+      - "8099"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: AtlasWorker/Dockerfile
+    image: qubic-atlas/worker:latest
+    environment:
+      ATLAS_URL: "http://api:8099"
+      VERIFIER: "/usr/local/bin/verifier"
+      # Multi-epoch: this image bundles all four era-binaries (build3 = /usr/local/bin/verifier,
+      # build0/1/2 = siblings). Advertised on claim so the server capability-matches jobs.
+      ATLAS_BUILDS: "build0,build1,build2,build3"
+      # Persistent Qubic identity per replica. {host} => container hostname, so replicas sharing
+      # the worker-keys volume keep DISTINCT, stable identities across restarts (N-of-M consensus
+      # needs distinct workers; reputation persists because the key persists).
+      ATLAS_KEY_FILE: "/data/worker-{host}.key"
+    volumes:
+      - worker-keys:/data
+    depends_on:
+      - api
+    deploy:
+      replicas: 2   # scale the verifier network: docker compose up --scale worker=N
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    image: qubic-atlas/frontend:latest
+    environment:
+      ATLAS_UPSTREAM: "api:8099"   # nginx proxies /api/ -> the api service
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  atlas-cache:
+  clickhouse-data:
+  worker-keys:   # persistent per-worker Qubic identities (so reputation survives restarts)

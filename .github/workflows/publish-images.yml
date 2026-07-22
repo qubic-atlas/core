@@ -1,0 +1,68 @@
+name: Publish Qubic Atlas images
+
+# Builds and pushes all images to Docker Hub (qubiclab/atlas-*).
+# Tag a release (git tag v1.2.3 && git push --tags) or run manually.
+# Requires repo secrets: DOCKERHUB_USERNAME (= qubiclab) and DOCKERHUB_TOKEN.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (defaults to git tag or 'latest')"
+        required: false
+
+env:
+  OWNER: qubiclab
+  # single daemon build (no buildx) so api/worker can COPY --from the local verifier image
+  DOCKER_BUILDKIT: "1"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version tag
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then V="${{ github.event.inputs.tag }}";
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then V="${GITHUB_REF#refs/tags/}";
+          else V="latest"; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building version: $V"
+
+      - name: Docker Hub login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build verifier (self-tests score 321 in-build)
+        run: |
+          docker build -t qubic-atlas/verifier:latest \
+                       -t $OWNER/atlas-verifier:${{ steps.ver.outputs.version }} \
+                       -t $OWNER/atlas-verifier:latest ./scorer
+
+      - name: Build api (bakes in the verifier binary)
+        run: |
+          docker build -t $OWNER/atlas-api:${{ steps.ver.outputs.version }} \
+                       -t $OWNER/atlas-api:latest ./backend
+
+      - name: Build worker
+        run: |
+          docker build -f backend/AtlasWorker/Dockerfile \
+                       -t $OWNER/atlas-worker:${{ steps.ver.outputs.version }} \
+                       -t $OWNER/atlas-worker:latest ./backend
+
+      - name: Build frontend
+        run: |
+          docker build -t $OWNER/atlas-frontend:${{ steps.ver.outputs.version }} \
+                       -t $OWNER/atlas-frontend:latest ./frontend
+
+      - name: Push all images
+        run: |
+          for img in verifier api worker frontend; do
+            docker push $OWNER/atlas-$img:${{ steps.ver.outputs.version }}
+            docker push $OWNER/atlas-$img:latest
+          done

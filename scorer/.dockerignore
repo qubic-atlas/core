@@ -1,0 +1,12 @@
+wasm
+coretree_wasm
+harness
+harness.cpp
+verifier
+annx_native
+*.o
+*.out
+recon_out.json
+sol.json
+v.json
+# historical binaries are copied in (built via build_hist.sh)

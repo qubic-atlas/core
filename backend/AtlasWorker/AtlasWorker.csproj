@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>AtlasWorker</RootNamespace>
+    <AssemblyName>AtlasWorker</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- FourQ / SchnorrQ signing for authenticated submissions. -->
+    <PackageReference Include="Qubic.Crypto" Version="1.5.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Share the server's canonical genome-id hash so the signed message matches byte-for-byte.
+         Copied next to the project inside the Docker build (see AtlasWorker/Dockerfile). -->
+    <Compile Include="../GenomeId.cs" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,40 @@
+/* ============================================================================
+   Design tokens — the single source of truth for color / spacing / typography.
+   Ported verbatim from the React reference web/src/styles.css :root block, plus
+   a few derived tokens the reference expressed as literals inline (neuron colors,
+   pulse colors, chip border/background tints). Nothing else in the app hard-codes
+   a color; components reference these variables only.
+   ========================================================================== */
+:root {
+  /* base palette */
+  --bg: #0b1016;
+  --bg2: #111a24;
+  --panel: #131e2a;
+  --panel2: #182636;
+  --line: #22344a;
+  --txt: #dce7f2;
+  --dim: #8397ac;
+  --accent: #00e0c6;
+  --accent2: #3a9bff;
+  --good: #34d399;
+  --bad: #f87171;
+  --warn: #fbbf24;
+  --evo: #c084fc;
+
+  /* neuron / synapse semantics (were inline literals in the reference) */
+  --neuron-input: #3a9bff;   /* == --accent2 */
+  --neuron-output: #00e0c6;  /* == --accent  */
+  --neuron-evolution: #c084fc; /* == --evo   */
+  --syn-pos: #00e0c6;        /* strengthening weight (teal) */
+  --syn-neg: #f87171;        /* inhibiting weight (red)     */
+  --pulse-pos: #8ffff0;
+  --pulse-neg: #ffb4b4;
+
+  /* misc surface tints reused across chips / banners */
+  --ink: #04121a;            /* dark text on accent fills */
+  --row-hover: #14202e;
+  --td-line: #182533;
+  --info-border: #24507a;    /* blue informational banner border */
+  --info-bg: rgba(58, 155, 255, .06);
+  --tooltip-bg: #0b1016;
+}
